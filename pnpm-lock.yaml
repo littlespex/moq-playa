@@ -280,6 +280,15 @@ importers:
       '@openmoq/transport':
         specifier: workspace:*
         version: link:../transport
+      '@svta/cml-abr':
+        specifier: ^0.3.0
+        version: 0.3.0(@svta/cml-utils@1.7.0)
+      '@svta/cml-throughput':
+        specifier: ^1.2.0
+        version: 1.2.0(@svta/cml-utils@1.7.0)
+      '@svta/cml-utils':
+        specifier: ^1.7.0
+        version: 1.7.0
 
   packages/player:
     dependencies:
@@ -643,6 +652,12 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@svta/cml-abr@0.3.0':
+    resolution: {integrity: sha512-/y+03prkM/zrGHFI3QVXdYC9nZ7WN6EWiECvbu/pysKd5AQzvzGZ57SXZmIz80/P+FZuorUDbYo/O1Crscre+A==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@svta/cml-utils': ^1.7.0
+
   '@svta/cml-drm@1.1.12':
     resolution: {integrity: sha512-BdUAKfD1mN8D8ZacQri+fcQpHe05z5I4wfc7QF7WYKQVFMhK7MCAJHZUyhaK8qVZtolIHFBdQvHzcKy7jTeiMQ==}
     engines: {node: '>=20'}
@@ -662,6 +677,12 @@ packages:
     engines: {node: '>=20'}
     peerDependencies:
       '@svta/cml-utils': ^1.6.2
+
+  '@svta/cml-throughput@1.2.0':
+    resolution: {integrity: sha512-j17yN5VK/yh0XbJ/RHp4V89OJ9LxVFkJbhzV3ztj1cI3E0F6lCdK8jtV2OcmpKifKKElHmLOoWz8ak1h6zNccg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@svta/cml-utils': ^1.7.0
 
   '@svta/cml-utils@1.7.0':
     resolution: {integrity: sha512-NNa9v5CxrmULRAu5zx1ENHVwF4xKfclEdm+OmaIZDwoTNLVpf7JGgwbxkYsbRQYPCZrQTTLlR4sVjwgS6gcmug==}
@@ -1560,6 +1581,10 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.59.0':
     optional: true
 
+  '@svta/cml-abr@0.3.0(@svta/cml-utils@1.7.0)':
+    dependencies:
+      '@svta/cml-utils': 1.7.0
+
   '@svta/cml-drm@1.1.12(@svta/cml-iso-bmff@1.0.7(@svta/cml-utils@1.7.0))(@svta/cml-utils@1.7.0)(@svta/cml-xml@1.2.2(@svta/cml-utils@1.7.0))':
     dependencies:
       '@svta/cml-iso-bmff': 1.0.7(@svta/cml-utils@1.7.0)
@@ -1571,6 +1596,10 @@ snapshots:
       '@svta/cml-utils': 1.7.0
 
   '@svta/cml-iso-bmff@1.0.7(@svta/cml-utils@1.7.0)':
+    dependencies:
+      '@svta/cml-utils': 1.7.0
+
+  '@svta/cml-throughput@1.2.0(@svta/cml-utils@1.7.0)':
     dependencies:
       '@svta/cml-utils': 1.7.0
 
