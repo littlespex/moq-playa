@@ -10,4 +10,4 @@ as noExternal. The bundled works and their licenses:
   Licensed under the Apache License, Version 2.0
   https://github.com/streaming-video-technology-alliance/common-media-library
 
-  Packages bundled: @svta/cml-utils
+  Packages bundled: @svta/cml-utils, @svta/cml-error-codes

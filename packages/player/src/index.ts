@@ -57,7 +57,7 @@ export type {
 
 // ─── Errors ──────────────────────────────────────────────────────────
 
-export { PlayerErrorCode, createPlayerError } from './errors.js';
+export { PlayerErrorCode, createPlayerError, toSvtaErrorCode } from './errors.js';
 export type {
   ErrorSeverity,
   ErrorSource,
