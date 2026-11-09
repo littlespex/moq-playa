@@ -1,11 +1,20 @@
 /**
  * Per-track constants a LOCMAF receiver takes from the CMAF Header.
  *
+ * The box tree is walked by {@link ./iso-box.js} so every malformation is
+ * reported with its draft section and byte offset; the fields of the located
+ * mdhd, hdlr and trex boxes are read with `@svta/cml-iso-bmff` readers.
+ * tkhd (track_ID only), tenc, frma and schm stay hand-read: CML's readers
+ * need the whole box where LOCMAF needs one leading field, its tenc reader
+ * does not model the version-1 pattern fields or the constant IV, and its
+ * frma/schm fourcc fields are numbers.
+ *
  * @see draft-einarsson-moq-locmaf-01 section 4.1 (single trak), section 6
  *   step 3 (track_ID, mdhd.timescale, trex defaults, tenc defaults), section 13
  * @module
  */
 
+import { IsoBoxReadView, readHdlr, readMdhd, readTrex } from '@svta/cml-iso-bmff';
 import { LocmafFormatError } from './errors.js';
 import { childBoxes, findChild, readBoxHeader, viewOf, fourccAt, type IsoBoxHeader } from './iso-box.js';
 
@@ -57,6 +66,20 @@ function requireContent(box: IsoBoxHeader, bytes: number): void {
 }
 
 /**
+ * Read the fields of a box the walker located, with a `@svta/cml-iso-bmff`
+ * reader over its content. CML's readers throw a RangeError when the box is
+ * too short for its fields; that is reported as a section 6 error at the box,
+ * matching the walker's own malformation reports.
+ */
+function readFields<T>(buf: Uint8Array, box: IsoBoxHeader, reader: (view: IsoBoxReadView) => T): T {
+    try {
+        return reader(new IsoBoxReadView(buf.subarray(box.contentStart, box.end)));
+    } catch {
+        throw new LocmafFormatError(SECTION, box.start, `'${box.type}' box too short for its fields`);
+    }
+}
+
+/**
  * Parse a CMAF Header (ftyp + moov) into the LOCMAF track context.
  *
  * The sample entry is not a reconstruction input (section 6 step 3 names
@@ -89,6 +112,9 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
     const trak = traks[0]!;
 
     const tkhd = need(findChild(init, trak.contentStart, trak.end, 'tkhd', SECTION), 'tkhd', trak.start);
+    // track_ID is read at its fixed offset rather than through CML's readTkhd,
+    // which needs the whole 80/92-byte box: a Header whose tkhd stops after
+    // track_ID is still usable, and reconstruction needs nothing past it.
     const tkhdV1 = init[tkhd.contentStart] === 1;
     requireContent(tkhd, tkhdV1 ? 24 : 16);
     const trackId = view.getUint32(tkhd.contentStart + (tkhdV1 ? 20 : 12));
@@ -96,15 +122,9 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
     const mdia = need(findChild(init, trak.contentStart, trak.end, 'mdia', SECTION), 'mdia', trak.start);
     const mdiaChildren = childBoxes(init, mdia.contentStart, mdia.end, SECTION);
     const mdhd = need(mdiaChildren.find((b) => b.type === 'mdhd'), 'mdhd', mdia.start);
-    const mdhdV1 = init[mdhd.contentStart] === 1;
-    requireContent(mdhd, mdhdV1 ? 24 : 16);
-    const timescale = view.getUint32(mdhd.contentStart + (mdhdV1 ? 20 : 12));
+    const { timescale } = readFields(init, mdhd, readMdhd);
     const hdlr = mdiaChildren.find((b) => b.type === 'hdlr');
-    let handlerType = '';
-    if (hdlr !== undefined) {
-        requireContent(hdlr, 12);
-        handlerType = fourccAt(init, hdlr.contentStart + 8);
-    }
+    const handlerType = hdlr === undefined ? '' : readFields(init, hdlr, readHdlr).handlerType;
 
     const minf = mdiaChildren.find((b) => b.type === 'minf');
     const stbl = minf && findChild(init, minf.contentStart, minf.end, 'stbl', SECTION);
@@ -155,17 +175,18 @@ export function parseLocmafTrackContext(init: Uint8Array): LocmafTrackContext {
     const mvex = need(moovChildren.find((b) => b.type === 'mvex'), 'mvex', moov.start);
     const trex = childBoxes(init, mvex.contentStart, mvex.end, SECTION)
         .filter((b) => b.type === 'trex' && b.end - b.contentStart >= 24)
-        .find((b) => view.getUint32(b.contentStart + 4) === trackId);
+        .map((b) => readFields(init, b, readTrex))
+        .find((b) => b.trackId === trackId);
     if (trex === undefined) {
         throw new LocmafFormatError(SECTION, mvex.start, `no trex for track ${trackId}`);
     }
     return {
         trackId,
         timescale,
-        defaultSampleDescriptionIndex: view.getUint32(trex.contentStart + 8),
-        defaultSampleDuration: view.getUint32(trex.contentStart + 12),
-        defaultSampleSize: view.getUint32(trex.contentStart + 16),
-        defaultSampleFlags: view.getUint32(trex.contentStart + 20),
+        defaultSampleDescriptionIndex: trex.defaultSampleDescriptionIndex,
+        defaultSampleDuration: trex.defaultSampleDuration,
+        defaultSampleSize: trex.defaultSampleSize,
+        defaultSampleFlags: trex.defaultSampleFlags,
         handlerType,
         sampleEntryType: entry?.type ?? null,
         codecFourcc,

@@ -5,9 +5,49 @@
  * Used by both CmafAssembler (moof/mdat pairing) and MseMediaSource
  * (init segment filtering).
  *
+ * Box structure and field parsing is delegated to `@svta/cml-iso-bmff`
+ * (readIsoBoxes with the tfhd/trun/trex/mdhd/hdlr/tkhd readers). What stays
+ * local is Playa policy, not parsing:
+ *
+ *   - Top-level segment framing (`readSegmentTimeRanges`, `peekSegmentMetadata`,
+ *     `locateMoofMdat`) keeps the tolerant walk that clamps an overrunning
+ *     top-level moof to the buffer (the conformance corpus pins that
+ *     behaviour), whereas CML stops at a box that overruns its container.
+ *   - `tfdt` is read with a local reader through CML's custom-reader hook so
+ *     `baseMediaDecodeTime` stays a `bigint`: CML's `readTfdt` returns a
+ *     `number`, which loses precision above 2^53.
+ *   - `trun` is read through a guard that bounds `sample_count` before CML's
+ *     `readTrun` allocates one record per sample.
+ *   - The sample-dropping rewriter (`rewriteFragmentDropSamples`) and the
+ *     in-place tfdt patch are byte surgery on the original buffer; CML's
+ *     writers produce new boxes and have no in-place or splice operations.
+ *   - The HEVC NAL helpers are codec-layer, not ISO BMFF.
+ *
+ * Every function is TOTAL: malformed input yields null/empty, never a throw.
+ * CML's readers throw (RangeError) on a box too short for its fields, so each
+ * parse is wrapped and a thrown error is treated as "malformed".
+ *
  * @see ISO/IEC 14496-12 (ISO Base Media File Format)
  * @module
  */
+
+import {
+  IsoBoxReadView,
+  readHdlr,
+  readIsoBoxes,
+  readMdhd,
+  readTfhd,
+  readTkhd,
+  readTrex,
+  readTrun,
+  type HandlerReferenceBox,
+  type IsoBoxReaderMap,
+  type MediaHeaderBox,
+  type TrackExtendsBox,
+  type TrackFragmentHeaderBox,
+  type TrackHeaderBox,
+  type TrackRunBox,
+} from '@svta/cml-iso-bmff';
 
 /** Read a big-endian uint32 from a Uint8Array at offset. */
 export function readU32(data: Uint8Array, offset: number): number {
@@ -34,85 +74,157 @@ export function boxSize(data: Uint8Array, offset: number): number {
   return readU32(data, offset);
 }
 
-/** A child box discovered by {@link boundedBoxes}. */
-interface BoundedBox {
+// ─── CML parse layer ────────────────────────────────────────────────
+
+/**
+ * The shape every box parsed by {@link parseBoxes} shares: CML attaches the
+ * box `size` and a `view` over the whole box (header included) to each parsed
+ * box, and fills `boxes` for container types (moov, trak, mdia, mvex, moof,
+ * traf, ...). Field readers add their own properties on top (see the typed
+ * aliases below).
+ */
+interface ParsedBoxBase {
   readonly type: string;
-  readonly start: number;
   readonly size: number;
-  /** Offset of the box body (after the 8-byte header). */
-  readonly bodyStart: number;
-  /** Exclusive end offset (`start + size`). */
-  readonly end: number;
+  readonly view: IsoBoxReadView;
+  readonly boxes?: readonly ParsedBoxBase[];
+}
+
+type TfhdBox = ParsedBoxBase & TrackFragmentHeaderBox;
+type TrunBox = ParsedBoxBase & TrackRunBox;
+type TrexBox = ParsedBoxBase & TrackExtendsBox;
+type MdhdBox = ParsedBoxBase & MediaHeaderBox;
+type HdlrBox = ParsedBoxBase & HandlerReferenceBox;
+type TkhdBox = ParsedBoxBase & TrackHeaderBox;
+
+/** `tfdt` with a `bigint` baseMediaDecodeTime (CML's reader returns a number). */
+interface Tfdt64 {
+  readonly type: 'tfdt';
+  readonly version: number;
+  readonly flags: number;
+  readonly baseMediaDecodeTime: bigint;
+}
+type TfdtBox = ParsedBoxBase & Tfdt64;
+
+/**
+ * Upper bound on `trun.sample_count` accepted by {@link readTrunGuarded}.
+ * CML's `readTrun` allocates one record per declared sample even when the
+ * trun carries no per-sample fields, so an unbounded count from a malformed
+ * fragment would be a memory hazard. Real CMAF chunks carry tens to hundreds
+ * of samples per trun.
+ */
+const MAX_TRUN_SAMPLE_COUNT = 100_000;
+
+/**
+ * tfdt reader for CML's reader map. Reads the 64-bit value as a `bigint` and
+ * rejects versions other than 0/1 and a declared box too short for its value
+ * (the DataView is bounded to the box, so a short box throws RangeError).
+ */
+function readTfdt64(view: IsoBoxReadView): Tfdt64 {
+  const { version, flags } = view.readFullBox();
+  if (version !== 0 && version !== 1) {
+    throw new RangeError(`unsupported tfdt version ${version}`);
+  }
+  const dv = new DataView(view.buffer, view.byteOffset, view.byteLength);
+  const baseMediaDecodeTime = version === 0
+    ? BigInt(dv.getUint32(view.cursor))
+    : dv.getBigUint64(view.cursor);
+  view.jump(version === 0 ? 4 : 8);
+  return { type: 'tfdt', version, flags, baseMediaDecodeTime };
 }
 
 /**
- * Iterate the child boxes in `data[start, end)`, bounding `end` to the buffer.
- * Yields ONLY boxes fully contained within `[start, min(end, data.length))` — a
- * box whose declared size is `< 8`, or overruns the container / buffer, STOPS the
- * walk (a length that can't be trusted can't be used to find the next box).
- *
- * This is the single containment-checked walker every box reader should use, so
- * no reader can escape its box, its parent, or the buffer into a sibling. Future
- * fixed-layout readers (e.g. mdhd) MUST descend through this rather than
- * validating offsets against the backing buffer alone.
+ * trun reader for CML's reader map. Checks that the declared sample table fits
+ * the box and that `sample_count` is within {@link MAX_TRUN_SAMPLE_COUNT}
+ * before handing the view to CML's `readTrun`.
  */
-function* boundedBoxes(data: Uint8Array, start: number, end: number): Generator<BoundedBox> {
-  const limit = Math.min(end, data.byteLength);
-  let pos = start;
-  while (pos >= 0 && pos + 8 <= limit) {
-    const size = boxSize(data, pos);
-    if (size < 8 || pos + size > limit) return; // malformed / overruns container
-    yield { type: boxType(data, pos), start: pos, size, bodyStart: pos + 8, end: pos + size };
-    pos += size;
+function readTrunGuarded(view: IsoBoxReadView): TrackRunBox {
+  const start = view.cursor;
+  const { flags } = view.readFullBox();
+  const sampleCount = view.readUint(4);
+  const prelude = ((flags & TRUN_FLAG_DATA_OFFSET) ? 4 : 0)
+    + ((flags & TRUN_FLAG_FIRST_SAMPLE_FLAGS) ? 4 : 0);
+  const recordSize = ((flags & TRUN_FLAG_SAMPLE_DURATION) ? 4 : 0)
+    + ((flags & TRUN_FLAG_SAMPLE_SIZE) ? 4 : 0)
+    + ((flags & TRUN_FLAG_SAMPLE_FLAGS) ? 4 : 0)
+    + ((flags & TRUN_FLAG_SAMPLE_CTO) ? 4 : 0);
+  if (sampleCount > MAX_TRUN_SAMPLE_COUNT) {
+    throw new RangeError(`trun sample_count ${sampleCount} exceeds ${MAX_TRUN_SAMPLE_COUNT}`);
+  }
+  if (prelude + sampleCount * recordSize > view.bytesRemaining) {
+    throw new RangeError('trun sample table exceeds the box');
+  }
+  view.jump(start - view.cursor);
+  return readTrun(view);
+}
+
+/**
+ * Reader maps, one per purpose. Each function hands CML only the readers for
+ * the boxes it actually reads, so every other box stays raw (type, size,
+ * view, children) and a malformed unrelated box — a short tkhd in an init
+ * segment, say — cannot fail a trex lookup the way an all-boxes map would.
+ */
+/** moof → traf → tfhd / tfdt / trun. */
+const MOOF_READERS: IsoBoxReaderMap = { tfhd: readTfhd, tfdt: readTfdt64, trun: readTrunGuarded };
+/** moov → mvex → trex. */
+const TREX_READERS: IsoBoxReaderMap = { trex: readTrex };
+/** moov → trak → mdia → mdhd. */
+const MDHD_READERS: IsoBoxReaderMap = { mdhd: readMdhd };
+/** moov → trak → { tkhd, mdia → hdlr }, mvex → trex. */
+const TRAK_READERS: IsoBoxReaderMap = { hdlr: readHdlr, tkhd: readTkhd, trex: readTrex };
+
+/**
+ * Parse the boxes tiling `data` (containers recursively) with CML.
+ *
+ * Returns null when a box covered by `readers` is too short for its fields
+ * (CML throws). A box whose declared size overruns the buffer ends the walk
+ * without an error, as do its following siblings — CML's iterator treats it
+ * as truncation.
+ */
+function parseBoxes(data: Uint8Array, readers: IsoBoxReaderMap): readonly ParsedBoxBase[] | null {
+  try {
+    return readIsoBoxes(data, { readers }) as unknown as ParsedBoxBase[];
+  } catch {
+    return null;
   }
 }
 
+/** First child of `type` among `boxes`, typed by the caller. */
+function firstBox<T extends ParsedBoxBase>(boxes: readonly ParsedBoxBase[] | undefined, type: string): T | undefined {
+  return boxes?.find((b) => b.type === type) as T | undefined;
+}
+
+/** Every child of `type` among `boxes`, typed by the caller. */
+function allBoxes<T extends ParsedBoxBase>(boxes: readonly ParsedBoxBase[] | undefined, type: string): T[] {
+  return (boxes?.filter((b) => b.type === type) ?? []) as T[];
+}
+
+/** Offset of a parsed box's first header byte relative to `data`. */
+function boxStart(box: ParsedBoxBase, data: Uint8Array): number {
+  return box.view.byteOffset - data.byteOffset;
+}
+
+/** The parsed box's bytes (header included) as a view into `data`. */
+function boxBytes(box: ParsedBoxBase, data: Uint8Array): Uint8Array {
+  const start = boxStart(box, data);
+  return data.subarray(start, start + box.view.byteLength);
+}
+
+// ─── Init segment filtering ─────────────────────────────────────────
+
 /**
- * Find the handler type (hdlr box → handler_type) inside a trak box.
+ * Find the handler type (hdlr box → handler_type) inside a parsed trak.
  * Returns 'vide', 'soun', or null.
  */
-export function trakHandlerType(data: Uint8Array, trakStart: number, trakEnd: number): string | null {
-  let pos = trakStart + 8;
-  while (pos + 8 <= trakEnd) {
-    const size = boxSize(data, pos);
-    if (size < 8) break;
-    const type = boxType(data, pos);
-    if (type === 'mdia') {
-      let mdiaPos = pos + 8;
-      const mdiaEnd = pos + size;
-      while (mdiaPos + 8 <= mdiaEnd) {
-        const mSize = boxSize(data, mdiaPos);
-        if (mSize < 8) break;
-        if (boxType(data, mdiaPos) === 'hdlr' && mdiaPos + 16 <= mdiaEnd) {
-          return String.fromCharCode(
-            data[mdiaPos + 16]!, data[mdiaPos + 17]!,
-            data[mdiaPos + 18]!, data[mdiaPos + 19]!,
-          );
-        }
-        mdiaPos += mSize;
-      }
-    }
-    pos += size;
-  }
-  return null;
+function trakHandlerType(trak: ParsedBoxBase): string | null {
+  const mdia = firstBox(trak.boxes, 'mdia');
+  const hdlr = firstBox<HdlrBox>(mdia?.boxes, 'hdlr');
+  return hdlr?.handlerType ?? null;
 }
 
-/** Get track_id from tkhd inside a trak. */
-export function trakTrackId(data: Uint8Array, trakStart: number, trakEnd: number): number | null {
-  let pos = trakStart + 8;
-  while (pos + 8 <= trakEnd) {
-    const size = boxSize(data, pos);
-    if (size < 8) break;
-    if (boxType(data, pos) === 'tkhd') {
-      const version = data[pos + 8]!;
-      const trackIdOffset = version === 1 ? pos + 32 : pos + 20;
-      if (trackIdOffset + 4 <= trakEnd) {
-        return readU32(data, trackIdOffset);
-      }
-    }
-    pos += size;
-  }
-  return null;
+/** Get track_id from tkhd inside a parsed trak. */
+function trakTrackId(trak: ParsedBoxBase): number | null {
+  return firstBox<TkhdBox>(trak.boxes, 'tkhd')?.trackId ?? null;
 }
 
 /** Build a container box from a type string and children. */
@@ -133,24 +245,11 @@ export function buildBox(type: string, children: Uint8Array[]): Uint8Array {
 }
 
 /** Filter mvex to keep only trex entries matching keepTrackId. */
-export function filterMvex(data: Uint8Array, mvexStart: number, mvexEnd: number, keepTrackId: number): Uint8Array {
+function filterMvex(data: Uint8Array, mvex: ParsedBoxBase, keepTrackId: number): Uint8Array {
   const children: Uint8Array[] = [];
-  let pos = mvexStart + 8;
-  while (pos + 8 <= mvexEnd) {
-    const size = boxSize(data, pos);
-    if (size < 8) break;
-    const type = boxType(data, pos);
-    if (type === 'trex') {
-      if (pos + 16 <= mvexEnd) {
-        const trexTrackId = readU32(data, pos + 12);
-        if (trexTrackId === keepTrackId) {
-          children.push(data.slice(pos, pos + size));
-        }
-      }
-    } else {
-      children.push(data.slice(pos, pos + size));
-    }
-    pos += size;
+  for (const child of mvex.boxes ?? []) {
+    if (child.type === 'trex' && (child as TrexBox).trackId !== keepTrackId) continue;
+    children.push(boxBytes(child, data));
   }
   return buildBox('mvex', children);
 }
@@ -160,62 +259,31 @@ export function filterMvex(data: Uint8Array, mvexStart: number, mvexEnd: number,
  * the given handler type. MSE rejects moovs with non-matching traks.
  */
 export function filterInitSegment(initData: Uint8Array, keepHandler: 'vide' | 'soun'): Uint8Array {
-  let moovStart = -1;
-  let moovSize = 0;
-  let pos = 0;
-  while (pos + 8 <= initData.byteLength) {
-    const size = boxSize(initData, pos);
-    if (size < 8) break;
-    if (boxType(initData, pos) === 'moov') {
-      moovStart = pos;
-      moovSize = size;
-      break;
-    }
-    pos += size;
-  }
-  if (moovStart < 0) return initData;
+  const top = parseBoxes(initData, TRAK_READERS);
+  const moov = top ? firstBox(top, 'moov') : undefined;
+  if (!moov) return initData;
 
-  const moovEnd = moovStart + moovSize;
   let keepTrackId: number | null = null;
-  let trakCount = 0;
-
-  pos = moovStart + 8;
-  while (pos + 8 <= moovEnd) {
-    const size = boxSize(initData, pos);
-    if (size < 8) break;
-    if (boxType(initData, pos) === 'trak') {
-      trakCount++;
-      const handler = trakHandlerType(initData, pos, pos + size);
-      if (handler === keepHandler) {
-        keepTrackId = trakTrackId(initData, pos, pos + size);
-      }
-    }
-    pos += size;
+  const traks = allBoxes(moov.boxes, 'trak');
+  for (const trak of traks) {
+    if (trakHandlerType(trak) === keepHandler) keepTrackId = trakTrackId(trak);
   }
-
-  if (trakCount <= 1 || keepTrackId === null) return initData;
+  if (traks.length <= 1 || keepTrackId === null) return initData;
 
   const moovChildren: Uint8Array[] = [];
-  pos = moovStart + 8;
-  while (pos + 8 <= moovEnd) {
-    const size = boxSize(initData, pos);
-    if (size < 8) break;
-    const type = boxType(initData, pos);
-    if (type === 'trak') {
-      const handler = trakHandlerType(initData, pos, pos + size);
-      if (handler === keepHandler) {
-        moovChildren.push(initData.slice(pos, pos + size));
-      }
-    } else if (type === 'mvex') {
-      moovChildren.push(filterMvex(initData, pos, pos + size, keepTrackId));
+  for (const child of moov.boxes ?? []) {
+    if (child.type === 'trak') {
+      if (trakHandlerType(child) === keepHandler) moovChildren.push(boxBytes(child, initData));
+    } else if (child.type === 'mvex') {
+      moovChildren.push(filterMvex(initData, child, keepTrackId));
     } else {
-      moovChildren.push(initData.slice(pos, pos + size));
+      moovChildren.push(boxBytes(child, initData));
     }
-    pos += size;
   }
 
-  const before = initData.slice(0, moovStart);
-  const after = initData.slice(moovEnd);
+  const moovStart = boxStart(moov, initData);
+  const before = initData.subarray(0, moovStart);
+  const after = initData.subarray(moovStart + moov.view.byteLength);
   const newMoov = buildBox('moov', moovChildren);
   const result = new Uint8Array(before.byteLength + newMoov.byteLength + after.byteLength);
   let offset = 0;
@@ -228,27 +296,43 @@ export function filterInitSegment(initData: Uint8Array, keepHandler: 'vide' | 's
 /** Debug: list top-level box types and sizes. */
 export function describeBoxes(data: Uint8Array): string {
   const boxes: string[] = [];
-  let pos = 0;
-  while (pos + 8 <= data.byteLength) {
-    const size = boxSize(data, pos);
-    if (size < 8) break;
-    const type = boxType(data, pos);
-    boxes.push(`${type}(${size})`);
-    if (type === 'moov') {
-      let cpos = pos + 8;
-      while (cpos + 8 <= pos + size) {
-        const cs = boxSize(data, cpos);
-        if (cs < 8) break;
-        boxes.push(`  ${boxType(data, cpos)}(${cs})`);
-        cpos += cs;
+  try {
+    // Raw walk (no field readers) so a malformed leaf cannot abort the listing;
+    // CML stops at a box that overruns the buffer.
+    for (const box of new IsoBoxReadView(data) as Iterable<ParsedBoxBase>) {
+      boxes.push(`${box.type}(${box.size})`);
+      if (box.type === 'moov') {
+        for (const child of box.boxes ?? []) boxes.push(`  ${child.type}(${child.size})`);
       }
     }
-    pos += size;
+  } catch {
+    // A trailing partial box: keep what was listed so far.
   }
   return boxes.join(', ');
 }
 
 // ─── tfdt helpers (for CMAF segment assembler) ──────────────────────
+
+/**
+ * Parse a whole moof (header included) and locate the tfdt of its first traf.
+ *
+ * The top-level moof must itself be fully present: a moof declaring more bytes
+ * than the buffer holds is truncated and is rejected here rather than parsed
+ * from partial content. Children are parsed by CML from the moof body, so a
+ * tfdt declaring more than its traf holds, or one too short for its version's
+ * value, yields null instead of reading into a sibling.
+ */
+function locateTfdt(moof: Uint8Array): { box: TfdtBox; offset: number } | null {
+  if (moof.byteLength < 8 || boxType(moof, 0) !== 'moof') return null;
+  const moofSize = boxSize(moof, 0);
+  if (moofSize < 8 || moofSize > moof.byteLength) return null;
+  const children = parseBoxes(moof.subarray(8, moofSize), MOOF_READERS);
+  if (!children) return null;
+  const traf = firstBox(children, 'traf');
+  const tfdt = firstBox<TfdtBox>(traf?.boxes, 'tfdt');
+  if (!tfdt) return null;
+  return { box: tfdt, offset: boxStart(tfdt, moof) };
+}
 
 /**
  * Find the tfdt box offset inside a moof.
@@ -257,32 +341,8 @@ export function describeBoxes(data: Uint8Array): string {
  * @returns offset of the tfdt box start and its version, or null if not found
  */
 export function findTfdtOffset(moof: Uint8Array): { offset: number; version: number } | null {
-  // moof is the entire box including header
-  if (moof.byteLength < 8 || boxType(moof, 0) !== 'moof') return null;
-
-  // The top-level moof must itself be fully present: a moof declaring more bytes
-  // than the buffer holds is truncated, and boundedBoxes would only clamp `end`
-  // to the buffer — so validate the declared size against the buffer here before
-  // trusting any child offset.
-  const moofSize = boxSize(moof, 0);
-  if (moofSize < 8 || moofSize > moof.byteLength) return null;
-  for (const traf of boundedBoxes(moof, 8, moofSize)) {
-    if (traf.type !== 'traf') continue;
-    for (const tfdt of boundedBoxes(moof, traf.bodyStart, traf.end)) {
-      if (tfdt.type !== 'tfdt') continue;
-      // fullbox: version(1) + flags(3) + baseMediaDecodeTime(4 for v0, 8 for v1).
-      // The DECLARED tfdt box must be large enough to hold version + value (v0 ≥16
-      // bytes, v1 ≥20); any other version is rejected. boundedBoxes already
-      // guarantees the whole box is within traf → moof → buffer, so the value read
-      // in readBaseMediaDecodeTime can never spill into the following sibling box.
-      if (tfdt.size < 12) return null; // no version byte
-      const version = moof[tfdt.bodyStart]!;
-      const need = version === 0 ? 16 : version === 1 ? 20 : 0;
-      if (need === 0 || tfdt.size < need) return null;
-      return { offset: tfdt.start, version };
-    }
-  }
-  return null;
+  const tfdt = locateTfdt(moof);
+  return tfdt ? { offset: tfdt.offset, version: tfdt.box.version } : null;
 }
 
 /**
@@ -291,23 +351,7 @@ export function findTfdtOffset(moof: Uint8Array): { offset: number; version: num
  * @returns baseMediaDecodeTime as bigint, or null if tfdt not found
  */
 export function readBaseMediaDecodeTime(moof: Uint8Array): bigint | null {
-  const tfdt = findTfdtOffset(moof);
-  if (!tfdt) return null;
-
-  const view = new DataView(moof.buffer, moof.byteOffset, moof.byteLength);
-  // tfdt layout: size(4) + type(4) + version(1) + flags(3) + baseMediaDecodeTime(4 or 8)
-  const valueOffset = tfdt.offset + 12; // after box header (8) + fullbox header (4)
-
-  // A truncated tfdt (declared size too small to hold the value) must not read
-  // past the buffer — return null instead of throwing, keeping the parse total.
-  const valueBytes = tfdt.version === 0 ? 4 : 8;
-  if (valueOffset + valueBytes > moof.byteLength) return null;
-
-  if (tfdt.version === 0) {
-    return BigInt(view.getUint32(valueOffset));
-  } else {
-    return view.getBigUint64(valueOffset);
-  }
+  return locateTfdt(moof)?.box.baseMediaDecodeTime ?? null;
 }
 
 /**
@@ -318,22 +362,20 @@ export function readBaseMediaDecodeTime(moof: Uint8Array): bigint | null {
  * @param newValue New baseMediaDecodeTime value
  */
 export function patchBaseMediaDecodeTime(moof: Uint8Array, newValue: bigint): void {
-  const tfdt = findTfdtOffset(moof);
+  const tfdt = locateTfdt(moof);
   if (!tfdt) return;
 
-  const max = tfdt.version === 0 ? 0xffff_ffffn : 0xffff_ffff_ffff_ffffn;
+  const version = tfdt.box.version;
+  const max = version === 0 ? 0xffff_ffffn : 0xffff_ffff_ffff_ffffn;
   if (newValue < 0n || newValue > max) {
-    throw new RangeError(`baseMediaDecodeTime ${newValue} does not fit tfdt version ${tfdt.version}`);
+    throw new RangeError(`baseMediaDecodeTime ${newValue} does not fit tfdt version ${version}`);
   }
 
+  // tfdt layout: size(4) + type(4) + version(1) + flags(3) + baseMediaDecodeTime(4 or 8).
+  // locateTfdt proved the declared box holds the value (CML's bounded view).
   const view = new DataView(moof.buffer, moof.byteOffset, moof.byteLength);
   const valueOffset = tfdt.offset + 12;
-  // findTfdtOffset validates the declared box holds the value, but guard the
-  // write defensively so a malformed moof can never overwrite a sibling box.
-  const valueBytes = tfdt.version === 0 ? 4 : 8;
-  if (valueOffset + valueBytes > moof.byteLength) return;
-
-  if (tfdt.version === 0) {
+  if (version === 0) {
     view.setUint32(valueOffset, Number(newValue));
   } else {
     view.setBigUint64(valueOffset, newValue);
@@ -398,10 +440,6 @@ export type DiagnosticKind =
 
 // tfhd flags (ISO/IEC 14496-12 §8.8.7)
 const TFHD_FLAG_BASE_DATA_OFFSET = 0x000001;
-const TFHD_FLAG_SAMPLE_DESCRIPTION_INDEX = 0x000002;
-const TFHD_FLAG_DEFAULT_SAMPLE_DURATION = 0x000008;
-const TFHD_FLAG_DEFAULT_SAMPLE_SIZE = 0x000010;
-const TFHD_FLAG_DEFAULT_SAMPLE_FLAGS = 0x000020;
 
 // trun flags (ISO/IEC 14496-12 §8.8.8)
 const TRUN_FLAG_DATA_OFFSET = 0x000001;
@@ -412,62 +450,21 @@ const TRUN_FLAG_SAMPLE_FLAGS = 0x000400;
 const TRUN_FLAG_SAMPLE_CTO = 0x000800;
 
 /**
- * Parse tfhd for its flags-gated default_sample_duration.
- *
- * Layout: boxHeader(8) + version(1) + flags(3) + track_ID(4) +
- *         [base_data_offset(8) if flag 0x1] +
- *         [sample_description_index(4) if flag 0x2] +
- *         [default_sample_duration(4) if flag 0x8] +
- *         ... (remaining fields we don't need)
- */
-function parseTfhd(box: Uint8Array): { defaultSampleDuration?: number } {
-  if (box.byteLength < 16) return {};
-  const view = new DataView(box.buffer, box.byteOffset, box.byteLength);
-  const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11);
-  let pos = 16; // after box header + version/flags + track_ID
-  if ((flags & TFHD_FLAG_BASE_DATA_OFFSET) !== 0) pos += 8;
-  if ((flags & TFHD_FLAG_SAMPLE_DESCRIPTION_INDEX) !== 0) pos += 4;
-  if ((flags & TFHD_FLAG_DEFAULT_SAMPLE_DURATION) === 0) return {};
-  if (pos + 4 > box.byteLength) return {};
-  return { defaultSampleDuration: view.getUint32(pos) };
-}
-
-/**
- * Compute the total sample duration contributed by one trun box, using
+ * Compute the total sample duration contributed by one parsed trun, using
  * per-sample durations if present, else the supplied defaults.
  *
  * @returns `{ totalDuration, sampleCount, scored }` — `scored: false`
  *          means no duration source was usable for this trun.
  */
 function computeTrunDuration(
-  box: Uint8Array,
+  trun: TrunBox,
   tfhdDefault: number | undefined,
   trexDefault: number | undefined,
 ): { totalDuration: bigint; sampleCount: number; scored: boolean } {
-  if (box.byteLength < 16) return { totalDuration: 0n, sampleCount: 0, scored: false };
-  const view = new DataView(box.buffer, box.byteOffset, box.byteLength);
-  const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11);
-  const sampleCount = view.getUint32(12);
-  let pos = 16;
-  if ((flags & TRUN_FLAG_DATA_OFFSET) !== 0) pos += 4;
-  if ((flags & TRUN_FLAG_FIRST_SAMPLE_FLAGS) !== 0) pos += 4;
-
-  const hasPerSampleDuration = (flags & TRUN_FLAG_SAMPLE_DURATION) !== 0;
-
-  if (hasPerSampleDuration) {
-    const hasSize = (flags & TRUN_FLAG_SAMPLE_SIZE) !== 0;
-    const hasFlags = (flags & TRUN_FLAG_SAMPLE_FLAGS) !== 0;
-    const hasCto = (flags & TRUN_FLAG_SAMPLE_CTO) !== 0;
-    const recordSize = 4 + (hasSize ? 4 : 0) + (hasFlags ? 4 : 0) + (hasCto ? 4 : 0);
-    if (pos + sampleCount * recordSize > box.byteLength) {
-      return { totalDuration: 0n, sampleCount: 0, scored: false };
-    }
+  const sampleCount = trun.sampleCount;
+  if ((trun.flags & TRUN_FLAG_SAMPLE_DURATION) !== 0) {
     let total = 0n;
-    let p = pos;
-    for (let i = 0; i < sampleCount; i++) {
-      total += BigInt(view.getUint32(p));
-      p += recordSize;
-    }
+    for (const sample of trun.samples) total += BigInt(sample.sampleDuration ?? 0);
     return { totalDuration: total, sampleCount, scored: true };
   }
 
@@ -495,6 +492,10 @@ function computeTrunDuration(
  *             unknown). Caller fails open.
  *   - `[r1,...]`: every moof scored successfully. Caller checks each
  *             range against its timeline before appending.
+ *
+ * The top-level walk is local and tolerant: a moof whose declared size
+ * overruns the payload is clamped to the bytes present (the conformance
+ * corpus pins this). Its children are parsed by CML.
  *
  * @param segment Payload bytes (may start with styp/sidx prefix).
  * @param trex Track's trex defaults from the init segment, if known.
@@ -530,24 +531,13 @@ export function readSegmentTimeRanges(
     const moof = segment.subarray(pos, pos + size);
     pos += size;
 
-    // Walk moof for traf boxes.
-    const trafs: Uint8Array[] = [];
-    let innerPos = 8;
-    let malformed = false;
-    while (innerPos + 8 <= moof.byteLength) {
-      const s = boxSize(moof, innerPos);
-      if (s < 8) {
-        emit('malformed-moof', `moof at ${moofStart}: inner box size ${s} at ${innerPos}`);
-        malformed = true;
-        break;
-      }
-      if (boxType(moof, innerPos) === 'traf') {
-        trafs.push(moof.subarray(innerPos, innerPos + s));
-      }
-      innerPos += s;
+    const children = parseBoxes(moof.subarray(8), MOOF_READERS);
+    if (!children) {
+      emit('malformed-moof', `moof at ${moofStart}: a child box is too short for its fields`);
+      continue;
     }
-    if (malformed) continue;
 
+    const trafs = allBoxes(children, 'traf');
     if (trafs.length === 0) {
       emit('no-trun', `moof at ${moofStart}: no traf`);
       continue;
@@ -558,28 +548,9 @@ export function readSegmentTimeRanges(
     }
 
     const traf = trafs[0]!;
-
-    // Walk traf for tfhd, tfdt, and all trun boxes.
-    let tfhdBox: Uint8Array | null = null;
-    let tfdtBox: Uint8Array | null = null;
-    const trunBoxes: Uint8Array[] = [];
-    let trafPos = 8;
-    let trafMalformed = false;
-    while (trafPos + 8 <= traf.byteLength) {
-      const s = boxSize(traf, trafPos);
-      if (s < 8) {
-        emit('malformed-moof', `traf at moof ${moofStart}: inner box size ${s} at ${trafPos}`);
-        trafMalformed = true;
-        break;
-      }
-      const t = boxType(traf, trafPos);
-      const sub = traf.subarray(trafPos, trafPos + s);
-      if (t === 'tfhd') tfhdBox = sub;
-      else if (t === 'tfdt') tfdtBox = sub;
-      else if (t === 'trun') trunBoxes.push(sub);
-      trafPos += s;
-    }
-    if (trafMalformed) continue;
+    const tfhdBox = firstBox<TfhdBox>(traf.boxes, 'tfhd');
+    const tfdtBox = firstBox<TfdtBox>(traf.boxes, 'tfdt');
+    const trunBoxes = allBoxes<TrunBox>(traf.boxes, 'trun');
 
     if (!tfdtBox) {
       emit('no-tfdt', `moof at ${moofStart}: traf has no tfdt`);
@@ -590,33 +561,17 @@ export function readSegmentTimeRanges(
       continue;
     }
 
-    // Read bmd from tfdt.
-    const tfdtView = new DataView(tfdtBox.buffer, tfdtBox.byteOffset, tfdtBox.byteLength);
-    const tfdtVersion = tfdtBox[8]!;
-    let bmd: bigint;
-    if (tfdtVersion === 0) {
-      if (tfdtBox.byteLength < 16) {
-        emit('malformed-moof', `moof at ${moofStart}: tfdt v0 too short`);
-        continue;
-      }
-      bmd = BigInt(tfdtView.getUint32(12));
-    } else {
-      if (tfdtBox.byteLength < 20) {
-        emit('malformed-moof', `moof at ${moofStart}: tfdt v1 too short`);
-        continue;
-      }
-      bmd = tfdtView.getBigUint64(12);
-    }
+    const bmd = tfdtBox.baseMediaDecodeTime;
 
     // Resolve per-sample duration source for this moof's truns.
-    const tfhdInfo = tfhdBox ? parseTfhd(tfhdBox) : {};
+    const tfhdDefault = tfhdBox?.defaultSampleDuration;
     const trexDefault = trex?.defaultSampleDuration;
 
     let totalDuration = 0n;
     let totalSamples = 0;
     let allTrunsScored = true;
     for (const trun of trunBoxes) {
-      const r = computeTrunDuration(trun, tfhdInfo.defaultSampleDuration, trexDefault);
+      const r = computeTrunDuration(trun, tfhdDefault, trexDefault);
       if (!r.scored) {
         allTrunsScored = false;
         break;
@@ -648,44 +603,23 @@ export function readSegmentTimeRanges(
  * Read trex defaults for every track declared in an init segment's
  * moov → mvex → trex chain.
  *
- * trex body layout (fixed, no presence flags):
- *   version(1) + flags(3) + track_ID(4) +
- *   default_sample_description_index(4) +
- *   default_sample_duration(4) +
- *   default_sample_size(4) +
- *   default_sample_flags(4)
- *
- * @returns Map keyed by track_id. Empty if no mvex present.
+ * @returns Map keyed by track_id. Empty if no mvex present, or if the init is
+ *          malformed (a box too short for its fields, or a trex declaring a
+ *          size past its mvex, is never read from a following sibling).
  */
 export function readTrexDefaults(initSegment: Uint8Array): Map<number, TrexDefaults> {
   const result = new Map<number, TrexDefaults>();
+  const top = parseBoxes(initSegment, TREX_READERS);
+  if (!top) return result;
 
-  // Descend moov → mvex → trex through the containment-checked walker, so a trex
-  // declaring a size past its mvex (or the buffer) is never read — it can't
-  // fabricate fields from a following sibling box.
-  for (const moov of boundedBoxes(initSegment, 0, initSegment.byteLength)) {
-    if (moov.type !== 'moov') continue;
-    for (const mvex of boundedBoxes(initSegment, moov.bodyStart, moov.end)) {
-      if (mvex.type !== 'mvex') continue;
-      for (const trex of boundedBoxes(initSegment, mvex.bodyStart, mvex.end)) {
-        // A trex needs 32 bytes for the fixed fields we read. boundedBoxes has
-        // already proven the whole declared box fits mvex → moov → buffer, so the
-        // reads below stay inside the box.
-        if (trex.type !== 'trex' || trex.size < 32) continue;
-        const view = new DataView(initSegment.buffer, initSegment.byteOffset + trex.start, 32);
-        // trex layout (after box header + version+flags):
-        //   track_ID(4) + default_sample_description_index(4)
-        //   + default_sample_duration(4) + default_sample_size(4)
-        //   + default_sample_flags(4)
-        const trackId = view.getUint32(12);
-        const defaultSampleDuration = view.getUint32(20);
-        const defaultSampleSize = view.getUint32(24);
-        const defaultSampleFlags = view.getUint32(28);
-        result.set(trackId, {
-          trackId,
-          defaultSampleDuration,
-          defaultSampleSize,
-          defaultSampleFlags,
+  for (const moov of allBoxes(top, 'moov')) {
+    for (const mvex of allBoxes(moov.boxes, 'mvex')) {
+      for (const trex of allBoxes<TrexBox>(mvex.boxes, 'trex')) {
+        result.set(trex.trackId, {
+          trackId: trex.trackId,
+          defaultSampleDuration: trex.defaultSampleDuration,
+          defaultSampleSize: trex.defaultSampleSize,
+          defaultSampleFlags: trex.defaultSampleFlags,
         });
       }
     }
@@ -701,27 +635,19 @@ export function readTrexDefaults(initSegment: Uint8Array): Map<number, TrexDefau
  * CMAF init segments carry one track each, so the first mdhd found is
  * the track's timescale (video: e.g. 90000; audio: the sample rate).
  *
- * @returns The mdhd timescale, or null if no mdhd is present.
+ * @returns The mdhd timescale, or null if no mdhd is present, its version is
+ *          not 0 or 1, or its timescale is 0.
  */
 export function readMdhdTimescale(initSegment: Uint8Array): number | null {
-  for (const moov of boundedBoxes(initSegment, 0, initSegment.byteLength)) {
-    if (moov.type !== 'moov') continue;
-    for (const trak of boundedBoxes(initSegment, moov.bodyStart, moov.end)) {
-      if (trak.type !== 'trak') continue;
-      for (const mdia of boundedBoxes(initSegment, trak.bodyStart, trak.end)) {
-        if (mdia.type !== 'mdia') continue;
-        for (const mdhd of boundedBoxes(initSegment, mdia.bodyStart, mdia.end)) {
-          if (mdhd.type !== 'mdhd') continue;
-
-          const version = initSegment[mdhd.bodyStart]!;
-          const minimumSize = version === 0 ? 32 : version === 1 ? 44 : 0;
-          if (minimumSize === 0 || mdhd.size < minimumSize) return null;
-
-          // v0: version+flags(4) + creation(4) + modification(4) -> +20.
-          // v1: version+flags(4) + creation(8) + modification(8) -> +28.
-          const timescale = readU32(initSegment, mdhd.start + (version === 1 ? 28 : 20));
-          return timescale === 0 ? null : timescale;
-        }
+  const top = parseBoxes(initSegment, MDHD_READERS);
+  if (!top) return null;
+  for (const moov of allBoxes(top, 'moov')) {
+    for (const trak of allBoxes(moov.boxes, 'trak')) {
+      for (const mdia of allBoxes(trak.boxes, 'mdia')) {
+        const mdhd = firstBox<MdhdBox>(mdia.boxes, 'mdhd');
+        if (!mdhd) continue;
+        if (mdhd.version !== 0 && mdhd.version !== 1) return null;
+        return mdhd.timescale === 0 ? null : mdhd.timescale;
       }
     }
   }
@@ -861,6 +787,22 @@ export interface TfhdDefaults {
   readonly defaultSampleFlags?: number;
 }
 
+/** Parse a single standalone moof-level box (header included) with CML. */
+function parseSingleBox<T extends ParsedBoxBase>(box: Uint8Array, type: string): T | undefined {
+  const parsed = parseBoxes(box, MOOF_READERS);
+  const first = parsed?.[0];
+  return first && first.type === type ? first as T : undefined;
+}
+
+/** The flags-gated defaults of a parsed tfhd, with only the present keys set. */
+function tfhdDefaults(tfhd: TrackFragmentHeaderBox): TfhdDefaults {
+  const out: { defaultSampleDuration?: number; defaultSampleSize?: number; defaultSampleFlags?: number } = {};
+  if (tfhd.defaultSampleDuration !== undefined) out.defaultSampleDuration = tfhd.defaultSampleDuration;
+  if (tfhd.defaultSampleSize !== undefined) out.defaultSampleSize = tfhd.defaultSampleSize;
+  if (tfhd.defaultSampleFlags !== undefined) out.defaultSampleFlags = tfhd.defaultSampleFlags;
+  return out;
+}
+
 /**
  * Parse tfhd flags-gated default fields. Layout per §8.8.7:
  *   header(8) + version(1) + flags(3) + track_ID(4) +
@@ -869,31 +811,12 @@ export interface TfhdDefaults {
  *   [default_sample_duration(4)     if 0x000008] +
  *   [default_sample_size(4)         if 0x000010] +
  *   [default_sample_flags(4)        if 0x000020]
+ *
+ * Returns `{}` for a tfhd too short for the fields its flags announce.
  */
 export function parseTfhdDefaults(box: Uint8Array): TfhdDefaults {
-  if (box.byteLength < 16) return {};
-  const view = new DataView(box.buffer, box.byteOffset, box.byteLength);
-  const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11);
-  let pos = 16; // after box header + version/flags + track_ID
-  if ((flags & TFHD_FLAG_BASE_DATA_OFFSET) !== 0) pos += 8;
-  if ((flags & TFHD_FLAG_SAMPLE_DESCRIPTION_INDEX) !== 0) pos += 4;
-  const out: { defaultSampleDuration?: number; defaultSampleSize?: number; defaultSampleFlags?: number } = {};
-  if ((flags & TFHD_FLAG_DEFAULT_SAMPLE_DURATION) !== 0) {
-    if (pos + 4 > box.byteLength) return out;
-    out.defaultSampleDuration = view.getUint32(pos);
-    pos += 4;
-  }
-  if ((flags & TFHD_FLAG_DEFAULT_SAMPLE_SIZE) !== 0) {
-    if (pos + 4 > box.byteLength) return out;
-    out.defaultSampleSize = view.getUint32(pos);
-    pos += 4;
-  }
-  if ((flags & TFHD_FLAG_DEFAULT_SAMPLE_FLAGS) !== 0) {
-    if (pos + 4 > box.byteLength) return out;
-    out.defaultSampleFlags = view.getUint32(pos);
-    pos += 4;
-  }
-  return out;
+  const tfhd = parseSingleBox<TfhdBox>(box, 'tfhd');
+  return tfhd ? tfhdDefaults(tfhd) : {};
 }
 
 /** One sample's metadata as resolved from trun + tfhd + trex. */
@@ -920,6 +843,39 @@ export interface TrunSample {
 }
 
 /**
+ * Resolve the samples of a parsed trun against tfhd and trex defaults.
+ *
+ * Resolution priority (per §8.8.8 / §8.8.7):
+ *   - per-sample value in trun (if its flag is set)
+ *   - tfhd default (if its flag is set)
+ *   - trex default (last resort)
+ */
+function resolveTrunSamples(trun: TrackRunBox, tfhd: TfhdDefaults, trex?: TrexDefaults): TrunSample[] {
+  const defaultDuration = tfhd.defaultSampleDuration
+    ?? (trex && trex.defaultSampleDuration > 0 ? trex.defaultSampleDuration : undefined);
+  const defaultSize = tfhd.defaultSampleSize
+    ?? (trex && trex.defaultSampleSize > 0 ? trex.defaultSampleSize : undefined);
+  const defaultFlags = tfhd.defaultSampleFlags
+    ?? (trex && trex.defaultSampleFlags > 0 ? trex.defaultSampleFlags : undefined);
+
+  const out: TrunSample[] = [];
+  let mdatOffset = 0;
+  for (let i = 0; i < trun.sampleCount; i++) {
+    const sample = trun.samples[i] ?? {};
+    const duration = sample.sampleDuration ?? defaultDuration ?? 0;
+    const size = sample.sampleSize ?? defaultSize ?? 0;
+    // first_sample_flags overrides per-sample/default flags for sample 0
+    const flags = i === 0 && trun.firstSampleFlags !== undefined
+      ? trun.firstSampleFlags
+      : sample.sampleFlags ?? defaultFlags ?? 0;
+    const ctsOffset = sample.sampleCompositionTimeOffset ?? 0;
+    out.push({ index: i, mdatOffset, size, duration, ctsOffset, flags });
+    mdatOffset += size;
+  }
+  return out;
+}
+
+/**
  * Iterate samples described by a single trun box. Yields metadata
  * needed to slice the corresponding bytes out of mdat for re-packing.
  *
@@ -937,59 +893,9 @@ export function iterateTrunSamples(
   tfhd: TfhdDefaults,
   trex?: TrexDefaults,
 ): readonly TrunSample[] | null {
-  if (trun.byteLength < 16) return null;
-  const view = new DataView(trun.buffer, trun.byteOffset, trun.byteLength);
-  const version = view.getUint8(8);
-  const flags = (view.getUint8(9) << 16) | (view.getUint8(10) << 8) | view.getUint8(11);
-  const sampleCount = view.getUint32(12);
-
-  let pos = 16;
-  if ((flags & TRUN_FLAG_DATA_OFFSET) !== 0) pos += 4;
-  let firstSampleFlags = 0;
-  let hasFirstSampleFlags = false;
-  if ((flags & TRUN_FLAG_FIRST_SAMPLE_FLAGS) !== 0) {
-    if (pos + 4 > trun.byteLength) return null;
-    firstSampleFlags = view.getUint32(pos);
-    hasFirstSampleFlags = true;
-    pos += 4;
-  }
-
-  const hasPerDuration = (flags & TRUN_FLAG_SAMPLE_DURATION) !== 0;
-  const hasPerSize = (flags & TRUN_FLAG_SAMPLE_SIZE) !== 0;
-  const hasPerFlags = (flags & TRUN_FLAG_SAMPLE_FLAGS) !== 0;
-  const hasPerCto = (flags & TRUN_FLAG_SAMPLE_CTO) !== 0;
-  const recordSize = (hasPerDuration ? 4 : 0) + (hasPerSize ? 4 : 0)
-    + (hasPerFlags ? 4 : 0) + (hasPerCto ? 4 : 0);
-  if (pos + sampleCount * recordSize > trun.byteLength) return null;
-
-  const defaultDuration = tfhd.defaultSampleDuration
-    ?? (trex && trex.defaultSampleDuration > 0 ? trex.defaultSampleDuration : undefined);
-  const defaultSize = tfhd.defaultSampleSize
-    ?? (trex && trex.defaultSampleSize > 0 ? trex.defaultSampleSize : undefined);
-  const defaultFlags = tfhd.defaultSampleFlags
-    ?? (trex && trex.defaultSampleFlags > 0 ? trex.defaultSampleFlags : undefined);
-
-  const out: TrunSample[] = [];
-  let mdatOffset = 0;
-  for (let i = 0; i < sampleCount; i++) {
-    let duration = defaultDuration ?? 0;
-    let size = defaultSize ?? 0;
-    let sampleFlags = defaultFlags ?? 0;
-    let ctsOffset = 0;
-    let p = pos + i * recordSize;
-    if (hasPerDuration) { duration = view.getUint32(p); p += 4; }
-    if (hasPerSize) { size = view.getUint32(p); p += 4; }
-    if (hasPerFlags) { sampleFlags = view.getUint32(p); p += 4; }
-    if (hasPerCto) {
-      ctsOffset = version === 0 ? view.getUint32(p) : view.getInt32(p);
-      p += 4;
-    }
-    // first_sample_flags overrides per-sample/default flags for sample 0
-    if (i === 0 && hasFirstSampleFlags) sampleFlags = firstSampleFlags;
-    out.push({ index: i, mdatOffset, size, duration, ctsOffset, flags: sampleFlags });
-    mdatOffset += size;
-  }
-  return out;
+  const parsed = parseSingleBox<TrunBox>(trun, 'trun');
+  if (!parsed) return null;
+  return resolveTrunSamples(parsed, tfhd, trex);
 }
 
 // ─── Fragment rewriter (drop samples by keep-mask) ──────────────────
@@ -1030,58 +936,30 @@ function locateMoofMdat(segment: Uint8Array): {
  * Locate the single traf inside a moof, plus its tfhd and trun. Returns
  * `null` for shapes the rewriter doesn't handle (multi-traf, multi-trun,
  * malformed). Caller falls back to leaving the fragment untouched.
+ *
+ * Offsets are relative to the moof's first byte.
  */
 function locateTrafBoxes(moof: Uint8Array): {
   trafOffset: number; trafSize: number;
-  tfhdOffset: number; tfhdSize: number;
-  trunOffset: number; trunSize: number;
+  tfhd: TfhdBox; tfhdOffset: number;
+  trun: TrunBox; trunOffset: number; trunSize: number;
 } | null {
-  // Walk children of moof, find traf
-  let trafOffset = -1;
-  let trafSize = 0;
-  let trafCount = 0;
-  let pos = 8; // after moof box header
-  while (pos + 8 <= moof.byteLength) {
-    const s = boxSize(moof, pos);
-    if (s < 8) return null;
-    const t = boxType(moof, pos);
-    if (t === 'traf') {
-      trafCount++;
-      if (trafOffset === -1) {
-        trafOffset = pos;
-        trafSize = s;
-      }
-    }
-    pos += s;
-  }
-  if (trafCount !== 1 || trafOffset === -1) return null;
+  if (moof.byteLength < 8) return null;
+  const children = parseBoxes(moof.subarray(8), MOOF_READERS);
+  if (!children) return null;
+  const trafs = allBoxes(children, 'traf');
+  if (trafs.length !== 1) return null;
+  const traf = trafs[0]!;
 
-  // Walk children of traf, find tfhd + trun (single each)
-  let tfhdOffset = -1;
-  let tfhdSize = 0;
-  let trunOffset = -1;
-  let trunSize = 0;
-  let trunCount = 0;
-  pos = trafOffset + 8;
-  const trafEnd = trafOffset + trafSize;
-  while (pos + 8 <= trafEnd) {
-    const s = boxSize(moof, pos);
-    if (s < 8) return null;
-    const t = boxType(moof, pos);
-    if (t === 'tfhd' && tfhdOffset === -1) {
-      tfhdOffset = pos;
-      tfhdSize = s;
-    } else if (t === 'trun') {
-      trunCount++;
-      if (trunOffset === -1) {
-        trunOffset = pos;
-        trunSize = s;
-      }
-    }
-    pos += s;
-  }
-  if (tfhdOffset === -1 || trunOffset === -1 || trunCount !== 1) return null;
-  return { trafOffset, trafSize, tfhdOffset, tfhdSize, trunOffset, trunSize };
+  const tfhd = firstBox<TfhdBox>(traf.boxes, 'tfhd');
+  const truns = allBoxes<TrunBox>(traf.boxes, 'trun');
+  if (!tfhd || truns.length !== 1) return null;
+  const trun = truns[0]!;
+  return {
+    trafOffset: boxStart(traf, moof), trafSize: traf.view.byteLength,
+    tfhd, tfhdOffset: boxStart(tfhd, moof),
+    trun, trunOffset: boxStart(trun, moof), trunSize: trun.view.byteLength,
+  };
 }
 
 /**
@@ -1234,19 +1112,10 @@ export function rewriteFragmentDropSamples(
 
   // Reject fragments using absolute base_data_offset — re-anchoring is
   // out of scope for this rewriter.
-  const tfhdView = new DataView(
-    moof.buffer, moof.byteOffset + traf.tfhdOffset, traf.tfhdSize,
-  );
-  const tfhdFlags =
-    (tfhdView.getUint8(9) << 16) | (tfhdView.getUint8(10) << 8) | tfhdView.getUint8(11);
-  if ((tfhdFlags & TFHD_FLAG_BASE_DATA_OFFSET) !== 0) return null;
+  if ((traf.tfhd.flags & TFHD_FLAG_BASE_DATA_OFFSET) !== 0) return null;
 
-  const tfhdBox = moof.subarray(traf.tfhdOffset, traf.tfhdOffset + traf.tfhdSize);
   const trunBox = moof.subarray(traf.trunOffset, traf.trunOffset + traf.trunSize);
-  const tfhd = parseTfhdDefaults(tfhdBox);
-
-  const samples = iterateTrunSamples(trunBox, tfhd, trex);
-  if (!samples) return null;
+  const samples = resolveTrunSamples(traf.trun, tfhdDefaults(traf.tfhd), trex);
 
   // Validate mdat is large enough for the declared samples
   let totalSampleBytes = 0;
