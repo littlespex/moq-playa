@@ -53,7 +53,8 @@
     "@openmoq/loc": "workspace:*",
     "@openmoq/locmaf": "workspace:*",
     "@openmoq/msf": "workspace:*",
-    "@openmoq/playback": "workspace:*"
+    "@openmoq/playback": "workspace:*",
+    "@svta/cml-utils": "^1.7.0"
   },
   "scripts": {
     "build": "tsc && tsup",
