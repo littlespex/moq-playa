@@ -10,7 +10,8 @@ package's tsup config marks every dependency `noExternal`, so the CML code is
 bundled into `dist/browser`; the root `NOTICE` file carries the attribution
 that the Apache-2.0 license and `@svta/cml-abr`'s dash.js notice require.
 
-Versions adopted: `cml-utils` 1.7.0, `cml-error-codes` 0.1.2.
+Versions adopted: `cml-utils` 1.7.0, `cml-error-codes` 0.1.2, `cml-iso-bmff`
+1.0.7, `cml-drm` 1.1.12 (+ peer `cml-xml` 1.2.2).
 
 ---
 
@@ -84,6 +85,147 @@ hand-built `PlayerError` values stay valid.
   update failed"; the nearest fits (3000, 3010, 2018) are approximations. A
   MoQ/WebTransport-aware category or a "session control error" code would
   help.
+
+---
+
+## 3. `@svta/cml-iso-bmff` — box parsing
+
+**Replaced in `packages/browser/src/mp4-box.ts`.** Box structure and field
+parsing now go through `readIsoBoxes` with CML's `readTfhd`, `readTrun`,
+`readTrex`, `readMdhd`, `readHdlr` and `readTkhd`: init-segment filtering by
+handler and track_ID (`filterInitSegment`, mvex/trex filtering), trex defaults,
+mdhd timescale, tfdt lookup for read and in-place patch, segment time ranges,
+tfhd defaults, trun sample iteration, and the rewriter's traf/tfhd/trun
+locator. The hand-written `boundedBoxes` walker and all fixed-offset field
+reads are gone. Each function hands CML only the readers for the boxes it
+reads (`MOOF_READERS`, `TREX_READERS`, `MDHD_READERS`, `TRAK_READERS`), so an
+unrelated malformed box cannot fail an otherwise valid lookup, and each parse
+is wrapped so the module's total (null, never throw) contract holds.
+
+**Replaced in `packages/locmaf`.** `track-context.ts` reads the mdhd, hdlr
+and trex fields of the CMAF Header with CML readers through a small
+`readFields` adapter that converts a CML `RangeError` into the LOCMAF section 6
+error at the box offset.
+
+**Lines.** mp4-box.ts 1339 → 1208 lines (−357 / +226 after the rewrite);
+track-context.ts 193 → 214. Commit total +422 / −506.
+
+**Stayed local, and why.**
+- *Top-level segment framing* in `readSegmentTimeRanges`,
+  `peekSegmentMetadata` and `locateMoofMdat`: Playa clamps an overrunning
+  top-level moof to the buffer (corpus vector `bmff/box-overrun` pins it),
+  while CML's iterator stops at any box that overruns its container.
+- *A local tfdt reader* (plugged into CML's reader map) that keeps
+  `baseMediaDecodeTime` a `bigint`. CML's `readTfdt` returns a `number`,
+  lossy above 2^53; unit test case 9 and corpus vector
+  `bmff/frag-tfdt-v1-large` (9007199254740993) need the exact value.
+- *A trun guard* (also via the reader map) that bounds `sample_count` at
+  100 000 and checks the sample table against the box before CML's `readTrun`
+  allocates one record per declared sample.
+- *The in-place tfdt patch* and the *sample-dropping rewriter's* byte surgery
+  (`rewriteFragmentDropSamples`, `rewriteTrun`): CML writers produce new boxes
+  and have no splice or in-place operation; the rewriter must preserve
+  unknown trailing boxes verbatim and rebase `data_offset`.
+- *HEVC NAL helpers*: codec layer, not ISO BMFF.
+- *LOCMAF's box walker* (`iso-box.ts`) and its section-numbered error
+  reporting (`cmaf-chunk.ts`, `chunk-samples.ts`, `emsg.ts`): the unit tests
+  and the corpus pin section and byte offset on malformation, and CML's
+  reader silently stops on truncation (no position), misparses a box whose
+  size is 1..7, treats an unknown emsg version as v0, and returns 64-bit
+  values as `number`.
+- *tkhd track_ID* in `track-context.ts`: CML's `readTkhd` needs the whole
+  80/92-byte box; LOCMAF needs one leading field, and two synthetic fixtures
+  in the repo (and plausibly minimal real headers) stop 4 bytes short.
+- *tenc / frma / schm* in `track-context.ts`: CML's `readTenc` lumps
+  reserved + pattern + isProtected into one 3-byte field and omits the
+  version-1 pattern fields and the constant IV; `frma.dataFormat` and
+  `schm.schemeType` are numbers, not fourcc strings.
+- *`codecDescriptionFromInit`* (`frame.ts`): CML's `readAudioSampleEntryBox`
+  does not handle the QuickTime v1/v2 sound description extensions (44/64
+  fixed bytes), and sample entries of types without a reader (`av01`,
+  `Opus`, `vp09`, `fLaC`, ...) come back raw with no children.
+
+**Behaviour.** The documented contracts hold (all 1196 lines of mp4-box tests,
+the BMFF corpus, the fuzz and regression suites pass unchanged). Differences
+only on malformed input: CML reads a nested box with `size == 0` ("to end")
+or `size == 1` (largesize) as the spec says where Playa's walker stopped; a
+nested box too short for its fields now fails the enclosing parse (null)
+instead of being skipped; `readMdhdTimescale` still rejects versions other
+than 0/1 through an explicit check. `@openmoq/locmaf` now has a runtime
+dependency (its index.ts note was updated).
+
+**Upstream candidates.**
+- 64-bit fields (`tfdt.baseMediaDecodeTime`, `emsg.presentationTime`,
+  `sidx`, `mdhd` v1 times) are `number`; a `bigint` option or overload.
+- `readTrun` allocates `sample_count` records with no bound check against the
+  box; a trun whose flags declare no per-sample fields and a huge count is a
+  memory hazard. Validate `sampleCount * recordSize <= bytesRemaining` and
+  cap or lazily iterate.
+- The `IsoBoxReadView` iterator throws a `RangeError` on 1..7 trailing bytes
+  (header read past the end) instead of treating them as truncation, and
+  misparses a box whose declared size is 1..7 (cursor moves backwards).
+- Parse errors carry no byte offset or box path; spec-section style error
+  reporting needs that.
+- `readTenc`: expose `defaultIsProtected`, the version-1
+  `defaultCryptByteBlock` / `defaultSkipByteBlock`, and `defaultConstantIv`.
+- `readAudioSampleEntryBox`: honour the QuickTime v1/v2 extension sizes
+  before reading child boxes.
+- `frma.dataFormat` / `schm.schemeType` as fourcc strings (or export the
+  inverse of `fourCcToUint32`).
+- `ParsedBox` typing: a custom reader's return type is not assignable to
+  `ParsedIsoBox` unless it matches an `IsoBoxMap` entry, so consumers cast.
+
+---
+
+## 4. `@svta/cml-drm` — EME and license requests
+
+**Replaced in `packages/browser/src/mse-adapter.ts`.**
+- Key system access goes through `getKeySystemAccess` with a configuration
+  from `createMediaKeySystemConfiguration`, built from the codec strings that
+  `initialize()` receives for the selected tracks (`video/mp4; codecs="…"`,
+  `audio/mp4; codecs="…"`, robustness `''`, `initDataTypes: ['cenc']`). The
+  former constants (`avc1.640028`, `avc3.640028`, `mp4a.40.2`) survive only as
+  the fallback when an `encrypted` event arrives before `initialize()` or
+  when `DrmConfig.videoCodecs` / `audioCodecs` (new optional fields) are not
+  given. A video-only initialization no longer requests an audio capability.
+- The default key system is `WIDEVINE_KEY_SYSTEM`.
+- The license POST is a cml-drm `LicenseRequest`. For PlayReady key systems
+  the challenge and HTTP headers are unwrapped from the XML key message with
+  `getLicenseRequestFromMessage` / `getRequestHeadersFromMessage`; Widevine
+  and ClearKey messages are posted verbatim.
+
+**Lines.** +126 / −17 in mse-adapter.ts, +99 test lines.
+
+**Stayed local / not adopted.**
+- `getSupportedKeySystemConfiguration` relies on the legacy
+  `MediaKeys.isTypeSupported` and returns nothing on current UAs.
+- `parsePsshList` / `getPsshForKeySystem`: Playa never decodes the catalog's
+  CMSF `contentProtections[].drmSystem.pssh` strings (the msf types document
+  them as opaque, the player passes them through, and the EME path takes
+  its init data from the browser's `encrypted` event). Adopting the parser
+  without a consumer would be dead code. Follow-up: when the init segment
+  carries no pssh, decode the catalog pssh for the selected key system and
+  start the session from it; that needs a path from the player's catalog to
+  the adapter's `initialize()` config.
+- `getKeySystemAccess` swallows the UA's rejection reason, so the adapter
+  reports its own error naming the key system and the content types it
+  asked for.
+
+**Behaviour.** `DrmConfig` is backward compatible. Setup still starts in the
+constructor; it waits for the codecs from `initialize()`, and an `encrypted`
+event before that resolves the wait with the defaults, so every existing
+lifecycle test passes unchanged. The configuration now carries the EME
+defaults explicitly (`distinctiveIdentifier`/`persistentState: 'optional'`,
+`sessionTypes: ['temporary']`), which is what an unspecified configuration
+meant before.
+
+**Upstream candidates.**
+- `getKeySystemAccess` should surface the last rejection (or accept an
+  `onReject` callback) instead of returning `null`.
+- `createMediaKeySystemConfiguration` has no `initDataTypes` parameter;
+  callers spread it in.
+- A PSSH-list helper that accepts base64 strings (the CMSF/DASH catalog form)
+  directly would fit MoQ catalogs.
 
 ---
 
