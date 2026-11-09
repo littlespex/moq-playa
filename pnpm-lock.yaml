@@ -163,6 +163,9 @@ importers:
       '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport
+      '@svta/cml-iso-bmff':
+        specifier: ^1.0.7
+        version: 1.0.7(@svta/cml-utils@1.7.0)
       '@svta/cml-utils':
         specifier: ^1.7.0
         version: 1.7.0
@@ -233,7 +236,14 @@ importers:
         specifier: workspace:*
         version: link:../transport
 
-  packages/locmaf: {}
+  packages/locmaf:
+    dependencies:
+      '@svta/cml-iso-bmff':
+        specifier: ^1.0.7
+        version: 1.0.7(@svta/cml-utils@1.7.0)
+      '@svta/cml-utils':
+        specifier: ^1.7.0
+        version: 1.7.0
 
   packages/msf:
     dependencies:
@@ -629,6 +639,12 @@ packages:
 
   '@svta/cml-error-codes@0.1.2':
     resolution: {integrity: sha512-q1xL8W9JR0Yj7h2kAyRWqb7iT7UlOb/rXMDSVpY5EcXUR5w0zHfl22YG4+dYVqtV9XpoIxhp+nXSqZkTo3TSTg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@svta/cml-utils': ^1.6.2
+
+  '@svta/cml-iso-bmff@1.0.7':
+    resolution: {integrity: sha512-pYM60+pcGd8G8USeVKOe4X25FdmKd4ihTLQWRszxSE/E0I/SFugqeexdlXyBiJbOhkzc8PFceIWv+RvrB9+NDw==}
     engines: {node: '>=20'}
     peerDependencies:
       '@svta/cml-utils': ^1.6.2
@@ -1525,6 +1541,10 @@ snapshots:
     optional: true
 
   '@svta/cml-error-codes@0.1.2(@svta/cml-utils@1.7.0)':
+    dependencies:
+      '@svta/cml-utils': 1.7.0
+
+  '@svta/cml-iso-bmff@1.0.7(@svta/cml-utils@1.7.0)':
     dependencies:
       '@svta/cml-utils': 1.7.0
 

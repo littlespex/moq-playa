@@ -47,5 +47,9 @@
   "scripts": {
     "build": "tsc && tsup",
     "build:browser": "tsup"
+  },
+  "dependencies": {
+    "@svta/cml-iso-bmff": "^1.0.7",
+    "@svta/cml-utils": "^1.7.0"
   }
 }
