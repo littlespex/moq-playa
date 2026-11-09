@@ -321,8 +321,6 @@ export class MoqtPlayer {
   private qualityController: QualityController | null = null;
   private bandwidthEstimator: BandwidthEstimator | null = null;
   private bufferAbrController: BufferBasedController | null = null;
-  private bwEstimatorGroupId: bigint = -1n;
-  private bwEstimatorGroupBytes = 0;
   /** Estimated GOP duration in µs, computed from first two group arrivals. */
   private estimatedGopDurationUs = 2_000_000; // default 2s
   private subscriptionManager: SubscriptionManager | null = null;
@@ -796,7 +794,11 @@ export class MoqtPlayer {
    * otherwise normal) and invalidate its LOCMAF reference (§3).
    * Fetch streams and datagrams never enter this map.
    */
-  private readonly subgroupStreams = new Map<bigint, { trackAlias: bigint; groupId: bigint }>();
+  /**
+   * Open subgroup streams of the current session. `openedUs` and `bytes` time
+   * the group's transfer (header to FIN) for the throughput estimator.
+   */
+  private readonly subgroupStreams = new Map<bigint, { trackAlias: bigint; groupId: bigint; openedUs: number; bytes: number }>();
 
   /**
    * Restart-ladder state per track, keyed `${mediaType}:${trackName}`
@@ -1269,9 +1271,6 @@ export class MoqtPlayer {
     if (obj.kind === 'data') {
       const bytes = obj.payload ? obj.payload.byteLength : 0;
       this._stats.recordMediaObject(bytes);
-      if (mediaType === 'video' && bytes > 0) {
-        this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
-      }
     } else {
       this._stats.recordGapObject();
     }
@@ -2494,20 +2493,6 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
-        if (mediaType === 'video' && bytes > 0) {
-          const gid = BigInt(obj.groupId);
-          if (gid !== this.bwEstimatorGroupId) {
-            if (this.bwEstimatorGroupBytes > 0) {
-              this.bandwidthEstimator?.recordGroup(
-                this.bwEstimatorGroupBytes, this.clock.now(),
-              );
-            }
-            this.bwEstimatorGroupId = gid;
-            this.bwEstimatorGroupBytes = bytes;
-          } else {
-            this.bwEstimatorGroupBytes += bytes;
-          }
-        }
       } else {
         this._stats.recordGapObject();
       }
@@ -2566,10 +2551,6 @@ export class MoqtPlayer {
       if (obj.kind === 'data') {
         const bytes = obj.payload ? obj.payload.byteLength : 0;
         this._stats.recordMediaObject(bytes);
-        // CMAF: one moof+mdat per group — each object IS a group
-        if (mediaType === 'video' && bytes > 0) {
-          this.bandwidthEstimator?.recordGroup(bytes, this.clock.now());
-        }
       } else {
         this._stats.recordGapObject();
       }
@@ -6034,6 +6015,12 @@ export class MoqtPlayer {
 
       onObject: stageable((streamId, obj) => {
         if (this._destroyed || this.isTerminalState()) return;
+        // Throughput: account the bytes each current-session subgroup stream
+        // carries; the group's sample is taken when the stream closes.
+        if (conn === this.connection && obj.kind === 'data') {
+          const transfer = this.subgroupStreams.get(streamId);
+          if (transfer !== undefined) transfer.bytes += obj.payload?.byteLength ?? 0;
+        }
         // §10.4.2 FIRST_OBJECT: the subgroup id is the first object's id, known
         // only here. Record it so a later reset still reports a real value.
         const pendingSubgroup = subgroupLifecycle.get(streamId);
@@ -6359,6 +6346,13 @@ export class MoqtPlayer {
         const subgroup = closeMapsAuthoritative ? this.subgroupStreams.get(streamId) : undefined;
         if (subgroup !== undefined) {
           this.subgroupStreams.delete(streamId); // map never outlives the stream
+          // A video group's stream that ended cleanly is one throughput
+          // sample: its bytes over the time from its header to its FIN. A
+          // reset or a locally discarded stream measured nothing complete.
+          if (terminal === 'fin' && subgroup.bytes > 0
+              && this.subscriptionManager?.getMediaType(subgroup.trackAlias) === 'video') {
+            this.bandwidthEstimator?.recordGroup(subgroup.bytes, subgroup.openedUs, this.clock.now());
+          }
           if (terminal === 'reset') {
             this.livenessMonitor?.noteStreamReset(subgroup.trackAlias, performance.now());
             this.subscriptionManager?.invalidateLocmafGroup(subgroup.trackAlias, subgroup.groupId, conn);
@@ -6424,7 +6418,9 @@ export class MoqtPlayer {
           // session's header must not overwrite a colliding current stream id.
           if (conn !== this.connection) return;
           const sub = header.header;
-          this.subgroupStreams.set(streamId, { trackAlias: BigInt(sub.trackAlias), groupId: BigInt(sub.groupId) });
+          this.subgroupStreams.set(streamId, {
+            trackAlias: BigInt(sub.trackAlias), groupId: BigInt(sub.groupId), openedUs: this.clock.now(), bytes: 0,
+          });
           const alias = BigInt(sub.trackAlias);
           // Only FIRST_OBJECT defers its subgroup id; ZERO and EXPLICIT are
           // authoritative from the header, so reporting them as unknown would
@@ -7965,8 +7961,9 @@ export class MoqtPlayer {
       clock: this.clock,
       ladder: alts.map(t => ({ name: t.name, bitrateKbps: (t.bitrate ?? 0) / 1000 })),
       initialIndex: this.qualityController!.currentIndex,
-      lowThresholdUs: 500_000,
-      highThresholdUs: 4_000_000,
+      lowThresholdUs: this.config.abrLowBufferMs! * 1000,
+      highThresholdUs: this.config.abrHighBufferMs! * 1000,
+      upshiftBandwidthMultiple: this.config.abrUpshiftBandwidthMultiple!,
     }) : null;
   }
 

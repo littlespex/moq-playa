@@ -11,7 +11,8 @@ bundled into `dist/browser`; the root `NOTICE` file carries the attribution
 that the Apache-2.0 license and `@svta/cml-abr`'s dash.js notice require.
 
 Versions adopted: `cml-utils` 1.7.0, `cml-error-codes` 0.1.2, `cml-iso-bmff`
-1.0.7, `cml-drm` 1.1.12 (+ peer `cml-xml` 1.2.2).
+1.0.7, `cml-drm` 1.1.12 (+ peer `cml-xml` 1.2.2), `cml-throughput` 1.2.0,
+`cml-abr` 0.3.0.
 
 ---
 
@@ -226,6 +227,90 @@ meant before.
   callers spread it in.
 - A PSSH-list helper that accepts base64 strings (the CMSF/DASH catalog form)
   directly would fit MoQ catalogs.
+
+---
+
+## 5. `@svta/cml-throughput` and `@svta/cml-abr` — estimation and ABR
+
+**Replaced in `packages/playback`.**
+- `BandwidthEstimator` (`bandwidth-estimator.ts`) is now a thin wrapper over
+  `EwmaEstimator` (fast 2 s / slow 5 s half-lives, min 128 KB sampled, min
+  16 KB per group, min 5 ms transfer, estimate = min(fast, slow), 0 while
+  unknown). The sample is `{encodedBodySize: group bytes, duration: last
+  byte − first byte}` of the group's own subgroup stream.
+- `BufferBasedController` (`buffer-based-controller.ts`) keeps its interface
+  (`evaluate` → `commitUpshift` / `commitDownshift`, `index`, `currentTrack`,
+  `lowThresholdUs`, `highThresholdUs`, `setIndex`) and keeps Playa's buffer
+  policy, but answers "does the throughput sustain a higher rung" with
+  `createThroughputSelector`. Units: the ladder is reversed into cml-abr's
+  ascending `bandwidth` (bps) rungs, the buffer depth is divided by 10^6, and
+  `upshiftBandwidthMultiple` (2.25) becomes `upgradeFactor = 1 / 2.25` with
+  `safetyFactor = max(0.9, upgradeFactor)`, which reproduces the former
+  "throughput > next.bitrate × 2.25" rule exactly. A track without a bitrate
+  is given 1 bps (the former rule degenerated to "throughput > 0" for it).
+
+**Changed in `packages/player`.**
+- What is measured. The three `recordGroup(bytes, now)` call sites (LOC per
+  object, LOCMAF per accumulated group, CMAF per object) are gone. The player
+  now times each subgroup stream of the current session: `onDataStream`
+  stamps the header arrival, the raw `onObject` hook sums the bytes it
+  carries, and `onStreamClosed` with `fin` on a confirmed video alias
+  records one sample. Reset or locally discarded streams and audio streams
+  record nothing; datagram delivery has no stream and records nothing.
+- Thresholds. `abrLowBufferMs` (500), `abrHighBufferMs` (4000) and
+  `abrUpshiftBandwidthMultiple` (2.25) are new `QualityConfig` options with
+  defaults in `DEFAULT_PLAYER_CONFIG`; `syncBufferAbrController` reads them.
+  The 15 s post-downshift stability window stays a constant.
+
+**Lines.** bandwidth-estimator.ts 79 → 108, buffer-based-controller.ts
+131 → 196, player.ts +18 / −33 at the call sites, config.ts +21. Commit
+total +437 / −169 (tests and NOTICE included).
+
+**Tests.** `buffer-based-abr.sim.test.ts` passes unchanged.
+`bandwidth-adaptation.sim.test.ts` was rewritten for the new sample: it now
+models a link rate (transfer time = bytes × 8 / link) with idle gaps between
+groups, keeps the four original scenarios (low link, adequate link, mid-stream
+drop within 10 s, bursty delivery) and adds a warm-up / degenerate-sample
+case. The bursty scenario changed meaning deliberately: the 4 s gaps now
+carry no information at all, so the estimate equals the per-group transfer
+rate instead of a gap-diluted average. The player's ABR harness
+(`feedGroups` in `player.test.ts`) models the stream open, a 200 ms transfer
+and the FIN for each group so the "upshift when healthy + high bandwidth"
+case still exercises an estimate. A new player test checks that a group is
+sampled as bytes over header-to-FIN time and that reset and audio streams are
+ignored. One assertion in `player-catalog-bootstrap.test.ts` that compared
+the private `subgroupStreams` entry with `toEqual` now uses `toMatchObject`
+on the ownership fields, because the entry also carries the transfer timing.
+
+**Behaviour.**
+- Estimates no longer track the current track's bitrate in steady live
+  delivery because the inter-group gap is out of the measurement. When the
+  publisher paces a group at real time over a long-lived stream, the transfer
+  time equals the media duration and the estimate equals the track bitrate,
+  which is a floor on capacity rather than the capacity; whenever a group is
+  sent faster than real time (joining fetch, catch-up, a relay flushing), the
+  estimate shows the link.
+- A warm-up of 128 KB (and 16 KB per sample) replaces the former "5 groups"
+  warm-up.
+- Upshift decisions are unchanged for one-step moves; cml-abr may rate
+  several rungs as sustainable, the controller still recommends the next one.
+
+**Upstream candidates.**
+- `BitrateSelector` has no way to declare the current rung except through
+  `sample()`, so a controller that owns the index must send a bandwidth-only
+  sample before each `select()`. A `select` input field (or a `setCurrent`)
+  would remove that.
+- A MoQ-friendly throughput sample. CML's `ResourceTiming` models a request
+  with `startTime`, `duration`, `responseStart`. A subgroup stream has a
+  header time, a FIN time, the bytes carried, and the media duration those
+  bytes represent. An estimator that knows the media duration could discard
+  samples where transfer time ≈ media duration (publisher-paced, says nothing
+  about the link) and keep only bandwidth-bound transfers, or report a
+  "lower bound" flag. Playa's `BandwidthEstimator.recordGroup` is the shape
+  such a sample would take.
+- `createThroughputSelector` throws `RangeError` on a ladder with a
+  non-positive bandwidth; manifests with unknown bitrates are common in MoQ
+  catalogs, so a documented "unknown" convention would help.
 
 ---
 

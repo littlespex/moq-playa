@@ -394,6 +394,24 @@ export interface QualityConfig {
    */
   readonly qualitySwitchCooldownMs?: number;
 
+  /**
+   * Buffer depth in ms below which ABR downshifts immediately, whatever the
+   * throughput estimate says (the emergency brake). Default: 500.
+   */
+  readonly abrLowBufferMs?: number;
+
+  /**
+   * Buffer depth in ms the player must hold before ABR considers an upshift.
+   * Between this and `abrLowBufferMs` the player holds steady. Default: 4_000.
+   */
+  readonly abrHighBufferMs?: number;
+
+  /**
+   * The throughput estimate must exceed this multiple of the next-higher
+   * track's bitrate for an upshift to be approved. Default: 2.25.
+   */
+  readonly abrUpshiftBandwidthMultiple?: number;
+
 
   /**
    * Constraints for initial video track selection from altGroup.
@@ -728,6 +746,9 @@ export const DEFAULT_PLAYER_CONFIG = {
   autoQuality: true,
   startLevel: 'auto' as const,
   qualitySwitchCooldownMs: 5_000,
+  abrLowBufferMs: 500,
+  abrHighBufferMs: 4_000,
+  abrUpshiftBandwidthMultiple: 2.25,
 
   // Recovery
   maxConsecutiveGaps: 5,

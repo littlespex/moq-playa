@@ -1432,3 +1432,57 @@ describe('MSF-01 op-array delta reaches the player (delta-added track usable)', 
     await player.destroy();
   });
 });
+
+describe('ABR throughput sampling — a group is its stream transfer time', () => {
+  const b64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
+
+  async function bootWithClock() {
+    const clock = { nowUs: 0, now() { return this.nowUs; } };
+    const booted = await bootPlayer(
+      cmafCatalog([{ ...VIDEO_BASE, initData: b64(videoInit()) }, AUDIO_BASE]), { clock },
+    );
+    const videoAlias = await booted.reqIdFor('video');
+    const audioAlias = await booted.reqIdFor('audio');
+    const estimator = (booted.player as any).bandwidthEstimator as { getEstimateKbps(): number };
+    /** One group: its subgroup stream opens, carries `bytes` over `transferUs`, then ends with `terminal`. */
+    const group = (alias: unknown, streamId: bigint, groupId: number, bytes: number, transferUs: number,
+      terminal: 'fin' | 'reset' = 'fin') => {
+      booted.adapter.onDataStream(streamId, {
+        type: 'subgroup',
+        header: { typeByte: 0x10, trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0), publisherPriority: 128 },
+      });
+      clock.nowUs += transferUs;
+      booted.adapter._triggerObject(streamId, {
+        kind: 'data', trackAlias: alias, groupId: varint(groupId), subgroupId: varint(0), objectId: varint(0),
+        payload: boxPayload(['moof', 16], ['mdat', bytes - 16]),
+      } as MoqtObject);
+      booted.adapter.onStreamClosed(streamId, terminal === 'reset' ? 0 : undefined, terminal);
+    };
+    return { ...booted, clock, videoAlias, audioAlias, estimator, group };
+  }
+
+  it('estimates the link from bytes over header-to-FIN time, not from the gap between groups', async () => {
+    const h = await bootWithClock();
+    try {
+      // 250KB groups each crossing the link in 500ms (4 Mbps), published every
+      // 2s: the 1.5s idle gap is the encoder's cadence and must not count.
+      for (let g = 0; g < 10; g++) {
+        h.group(h.videoAlias, BigInt(100 + g), g, 250_000, 500_000);
+        h.clock.nowUs += 1_500_000;
+      }
+      const kbps = h.estimator.getEstimateKbps();
+      expect(kbps).toBeGreaterThan(3_600);
+      expect(kbps).toBeLessThan(4_400);
+    } finally { await h.player.destroy(); }
+  });
+
+  it('ignores reset streams and audio streams', async () => {
+    const h = await bootWithClock();
+    try {
+      for (let g = 0; g < 10; g++) h.group(h.videoAlias, BigInt(100 + g), g, 250_000, 500_000, 'reset');
+      for (let g = 0; g < 10; g++) h.group(h.audioAlias, BigInt(200 + g), g, 250_000, 500_000);
+      expect(h.estimator.getEstimateKbps()).toBe(0);
+      expect((h.player as any).subgroupStreams.size).toBe(0); // nothing leaks past stream close
+    } finally { await h.player.destroy(); }
+  });
+});
