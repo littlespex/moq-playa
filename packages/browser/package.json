@@ -54,7 +54,10 @@
     "@openmoq/player": "workspace:*",
     "@openmoq/webtransport": "workspace:*",
     "@openmoq/loc": "workspace:*",
-    "@svta/cml-utils": "^1.7.0"
+    "@svta/cml-utils": "^1.7.0",
+    "@svta/cml-iso-bmff": "^1.0.7",
+    "@svta/cml-drm": "^1.1.12",
+    "@svta/cml-xml": "^1.2.2"
   },
   "scripts": {
     "build": "tsc && tsup",

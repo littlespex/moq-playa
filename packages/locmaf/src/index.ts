@@ -4,8 +4,9 @@
  * Parses LOCMAF Objects (genBox, full/delta moof headers, rawBoxes), keeps the
  * per-group delta reference, and reconstructs canonical CMAF chunks that feed
  * an unmodified CMAF pipeline such as MSE. Also encodes CMAF chunks into
- * canonical LOCMAF Objects. Pure TypeScript, no runtime dependencies, no
- * browser APIs.
+ * canonical LOCMAF Objects. Pure TypeScript, no browser APIs; the only
+ * runtime dependency is the SVTA Common Media Library's ISO BMFF readers
+ * (`@svta/cml-iso-bmff`), used for CMAF Header field parsing.
  *
  * @see draft-einarsson-moq-locmaf-01
  * @module

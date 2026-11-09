@@ -163,9 +163,18 @@ importers:
       '@openmoq/webtransport':
         specifier: workspace:*
         version: link:../webtransport
+      '@svta/cml-drm':
+        specifier: ^1.1.12
+        version: 1.1.12(@svta/cml-iso-bmff@1.0.7(@svta/cml-utils@1.7.0))(@svta/cml-utils@1.7.0)(@svta/cml-xml@1.2.2(@svta/cml-utils@1.7.0))
+      '@svta/cml-iso-bmff':
+        specifier: ^1.0.7
+        version: 1.0.7(@svta/cml-utils@1.7.0)
       '@svta/cml-utils':
         specifier: ^1.7.0
         version: 1.7.0
+      '@svta/cml-xml':
+        specifier: ^1.2.2
+        version: 1.2.2(@svta/cml-utils@1.7.0)
 
   packages/compat-browser:
     dependencies:
@@ -233,7 +242,14 @@ importers:
         specifier: workspace:*
         version: link:../transport
 
-  packages/locmaf: {}
+  packages/locmaf:
+    dependencies:
+      '@svta/cml-iso-bmff':
+        specifier: ^1.0.7
+        version: 1.0.7(@svta/cml-utils@1.7.0)
+      '@svta/cml-utils':
+        specifier: ^1.7.0
+        version: 1.7.0
 
   packages/msf:
     dependencies:
@@ -627,8 +643,22 @@ packages:
     cpu: [x64]
     os: [win32]
 
+  '@svta/cml-drm@1.1.12':
+    resolution: {integrity: sha512-BdUAKfD1mN8D8ZacQri+fcQpHe05z5I4wfc7QF7WYKQVFMhK7MCAJHZUyhaK8qVZtolIHFBdQvHzcKy7jTeiMQ==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@svta/cml-iso-bmff': ^1.0.7
+      '@svta/cml-utils': ^1.6.2
+      '@svta/cml-xml': ^1.2.2
+
   '@svta/cml-error-codes@0.1.2':
     resolution: {integrity: sha512-q1xL8W9JR0Yj7h2kAyRWqb7iT7UlOb/rXMDSVpY5EcXUR5w0zHfl22YG4+dYVqtV9XpoIxhp+nXSqZkTo3TSTg==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@svta/cml-utils': ^1.6.2
+
+  '@svta/cml-iso-bmff@1.0.7':
+    resolution: {integrity: sha512-pYM60+pcGd8G8USeVKOe4X25FdmKd4ihTLQWRszxSE/E0I/SFugqeexdlXyBiJbOhkzc8PFceIWv+RvrB9+NDw==}
     engines: {node: '>=20'}
     peerDependencies:
       '@svta/cml-utils': ^1.6.2
@@ -636,6 +666,12 @@ packages:
   '@svta/cml-utils@1.7.0':
     resolution: {integrity: sha512-NNa9v5CxrmULRAu5zx1ENHVwF4xKfclEdm+OmaIZDwoTNLVpf7JGgwbxkYsbRQYPCZrQTTLlR4sVjwgS6gcmug==}
     engines: {node: '>=20'}
+
+  '@svta/cml-xml@1.2.2':
+    resolution: {integrity: sha512-YVP/dWszaEThjbMpWjyNiNY62aPriddXH5jv81jwNz1kCNiKUbUvsL7Zm7KGJd0MYH4ydM+hLjom/8qge4NEuw==}
+    engines: {node: '>=20'}
+    peerDependencies:
+      '@svta/cml-utils': ^1.6.2
 
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
@@ -1524,11 +1560,25 @@ snapshots:
   '@rollup/rollup-win32-x64-msvc@4.59.0':
     optional: true
 
+  '@svta/cml-drm@1.1.12(@svta/cml-iso-bmff@1.0.7(@svta/cml-utils@1.7.0))(@svta/cml-utils@1.7.0)(@svta/cml-xml@1.2.2(@svta/cml-utils@1.7.0))':
+    dependencies:
+      '@svta/cml-iso-bmff': 1.0.7(@svta/cml-utils@1.7.0)
+      '@svta/cml-utils': 1.7.0
+      '@svta/cml-xml': 1.2.2(@svta/cml-utils@1.7.0)
+
   '@svta/cml-error-codes@0.1.2(@svta/cml-utils@1.7.0)':
     dependencies:
       '@svta/cml-utils': 1.7.0
 
+  '@svta/cml-iso-bmff@1.0.7(@svta/cml-utils@1.7.0)':
+    dependencies:
+      '@svta/cml-utils': 1.7.0
+
   '@svta/cml-utils@1.7.0': {}
+
+  '@svta/cml-xml@1.2.2(@svta/cml-utils@1.7.0)':
+    dependencies:
+      '@svta/cml-utils': 1.7.0
 
   '@types/chai@5.2.3':
     dependencies:

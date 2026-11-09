@@ -17,6 +17,15 @@
 
 import type { MediaSourceLike } from '@openmoq/player';
 import {
+  createMediaKeySystemConfiguration,
+  getKeySystemAccess,
+  getLicenseRequestFromMessage,
+  getRequestHeadersFromMessage,
+  PLAYREADY_KEY_SYSTEM,
+  WIDEVINE_KEY_SYSTEM,
+  type LicenseRequest,
+} from '@svta/cml-drm';
+import {
   filterInitSegment,
   describeBoxes,
   peekSegmentMetadata,
@@ -183,6 +192,13 @@ export function validateStallThresholdMs(value: number | undefined): number {
  * DRM configuration for EME (Encrypted Media Extensions) support.
  * When provided, the adapter sets up MediaKeys on the video element
  * and handles license acquisition transparently.
+ *
+ * Key system access is negotiated with capabilities built from the codec
+ * strings `initialize()` receives for the selected tracks (via
+ * `@svta/cml-drm`'s createMediaKeySystemConfiguration). `videoCodecs` /
+ * `audioCodecs` pre-seed that list for consumers that know the codecs at
+ * construction; when neither is known before the first `encrypted` event,
+ * the historical defaults (avc1/avc3 High 4.0 and AAC-LC) are used.
  */
 export interface DrmConfig {
   /** License server URL — receives POST with the license challenge. */
@@ -191,6 +207,49 @@ export interface DrmConfig {
   readonly keySystem?: string;
   /** Optional license-server certificate passed to the CDM. */
   readonly serverCertificate?: Uint8Array;
+  /** Video codec strings (RFC 6381) to negotiate EME capabilities with. */
+  readonly videoCodecs?: readonly string[];
+  /** Audio codec strings (RFC 6381) to negotiate EME capabilities with. */
+  readonly audioCodecs?: readonly string[];
+}
+
+/** Codec strings the key system access request is built from. */
+interface DrmCodecs {
+  readonly video: readonly string[];
+  readonly audio: readonly string[];
+}
+
+/** Capabilities requested when no codec string is known yet. */
+const DEFAULT_DRM_CODECS: DrmCodecs = {
+  video: ['avc1.640028', 'avc3.640028'],
+  audio: ['mp4a.40.2'],
+};
+
+function drmCapabilities(mediaType: 'video' | 'audio', codecs: readonly string[]): MediaKeySystemMediaCapability[] {
+  return codecs.map((codec) => ({ contentType: `${mediaType}/mp4; codecs="${codec}"`, robustness: '' }));
+}
+
+/** The EME configuration requested for `codecs`; 'cenc' init data only (CMAF). */
+function drmKeySystemConfiguration(codecs: DrmCodecs): MediaKeySystemConfiguration {
+  return {
+    ...createMediaKeySystemConfiguration(
+      drmCapabilities('audio', codecs.audio),
+      drmCapabilities('video', codecs.video),
+    ),
+    initDataTypes: ['cenc'],
+  };
+}
+
+/** A promise plus its resolver; resolving twice is a no-op. */
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  readonly resolve: (value: T) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
 }
 
 interface DrmElementState {
@@ -667,6 +726,12 @@ export class MseMediaSource implements MediaSourceLike {
   private readonly drmConfig: DrmConfig | null = null;
   private mediaKeys: MediaKeys | null = null;
   private mediaKeysReady: Promise<void> | null = null;
+  /**
+   * Codecs the key system request waits for: resolved by initialize() with
+   * the selected tracks' codecs, by the DrmConfig when it names them, or
+   * with null (defaults) if an `encrypted` event or destroy() comes first.
+   */
+  private readonly drmCodecs: Deferred<DrmCodecs | null> | null = null;
   private readonly keySessions = new Map<MediaKeySession, DrmSessionState>();
   // Attachment can outlive an adapter; serialize it across reconnects on the
   // same element. Sessions and license requests remain adapter-owned.
@@ -915,6 +980,10 @@ export class MseMediaSource implements MediaSourceLike {
     } : null;
     if (this.drmConfig) {
       const config = this.drmConfig;
+      this.drmCodecs = deferred();
+      if (config.videoCodecs || config.audioCodecs) {
+        this.drmCodecs.resolve({ video: config.videoCodecs ?? [], audio: config.audioCodecs ?? [] });
+      }
       let state = MseMediaSource.drmElements.get(this.video);
       if (!state) {
         state = { ready: Promise.resolve(), keys: null, keySystem: null, certificate: undefined };
@@ -986,6 +1055,11 @@ export class MseMediaSource implements MediaSourceLike {
       return false;
     }
     this.initialized = true;
+    // The selected tracks' codecs drive the EME capability negotiation.
+    this.drmCodecs?.resolve({
+      video: config.video ? [config.video.codec] : [],
+      audio: config.audio ? [config.audio.codec] : [],
+    });
 
     const generation = this.bufferGen;
     const doInit = () => {
@@ -1385,6 +1459,7 @@ export class MseMediaSource implements MediaSourceLike {
     this.video.removeEventListener('timeupdate', this.handleTimeUpdate);
     this.video.removeEventListener('error', this.handleVideoError);
     this.video.removeEventListener('encrypted', this.handleEncrypted);
+    this.drmCodecs?.resolve(null);
     for (const session of this.keySessions.keys()) this.retireKeySession(session);
     this.mediaKeys = null;
     // Leave the attachment available for a compatible reconnect. Temporary
@@ -1412,8 +1487,8 @@ export class MseMediaSource implements MediaSourceLike {
    * browser enqueues encrypted frames until keys are available.
    */
   private async setupMediaKeys(drm: DrmConfig, state: DrmElementState): Promise<void> {
-    if (this.destroyed) return;
-    const keySystem = drm.keySystem ?? 'com.widevine.alpha';
+    if (this.destroyed || !this.drmCodecs) return;
+    const keySystem = drm.keySystem ?? WIDEVINE_KEY_SYSTEM;
     try {
       await state.ready;
       if (this.destroyed) return;
@@ -1425,17 +1500,16 @@ export class MseMediaSource implements MediaSourceLike {
         this.mediaKeys = state.keys;
         return;
       }
-      const access = await navigator.requestMediaKeySystemAccess(keySystem, [{
-        initDataTypes: ['cenc'],
-        videoCapabilities: [
-          { contentType: 'video/mp4; codecs="avc1.640028"', robustness: '' },
-          { contentType: 'video/mp4; codecs="avc3.640028"', robustness: '' },
-        ],
-        audioCapabilities: [
-          { contentType: 'audio/mp4; codecs="mp4a.40.2"', robustness: '' },
-        ],
-      }]);
+      const codecs = await this.drmCodecs.promise;
       if (this.destroyed) return;
+      const configuration = drmKeySystemConfiguration(codecs ?? DEFAULT_DRM_CODECS);
+      const access = await getKeySystemAccess([{ keySystem, configurations: [configuration] }]);
+      if (this.destroyed) return;
+      if (!access) {
+        const requested = [...(configuration.videoCapabilities ?? []), ...(configuration.audioCapabilities ?? [])]
+          .map((c) => c.contentType).join(', ');
+        throw new Error(`No MediaKeySystemAccess for ${keySystem} with [${requested}]`);
+      }
       const keys = await access.createMediaKeys();
       if (this.destroyed) return;
       if (drm.serverCertificate) {
@@ -1468,6 +1542,9 @@ export class MseMediaSource implements MediaSourceLike {
    */
   private handleEncrypted = async (event: MediaEncryptedEvent): Promise<void> => {
     if (this.destroyed || !this.drmConfig || !event.initData) return;
+    // Encrypted media before initialize() named the codecs: negotiate with
+    // the defaults rather than hold the CDM session back.
+    this.drmCodecs?.resolve(null);
     const initData = new Uint8Array(event.initData).slice();
     let session: MediaKeySession | null = null;
     try {
@@ -1492,6 +1569,23 @@ export class MseMediaSource implements MediaSourceLike {
   };
 
   /**
+   * The license request for a CDM message. PlayReady wraps the challenge and
+   * the HTTP headers the server expects in an XML key message; `@svta/cml-drm`
+   * unwraps both. Other key systems (Widevine, ClearKey) post the message
+   * verbatim.
+   */
+  private licenseRequest(drm: DrmConfig, message: ArrayBuffer): LicenseRequest {
+    const playReady = (drm.keySystem ?? WIDEVINE_KEY_SYSTEM).startsWith(PLAYREADY_KEY_SYSTEM);
+    return {
+      url: drm.licenseUrl,
+      method: 'POST',
+      responseType: 'arraybuffer',
+      data: playReady ? getLicenseRequestFromMessage(message) : message,
+      ...(playReady ? { headers: getRequestHeadersFromMessage(message) } : {}),
+    };
+  }
+
+  /**
    * Handle license request from the CDM. POST the challenge to the
    * license server and feed the response back to the session.
    */
@@ -1501,9 +1595,11 @@ export class MseMediaSource implements MediaSourceLike {
     if (!this.drmConfig || !state || this.destroyed) return;
     const live = (): boolean => !this.destroyed && this.keySessions.get(session) === state;
     try {
-      const response = await fetch(this.drmConfig.licenseUrl, {
-        method: 'POST',
-        body: event.message,
+      const request = this.licenseRequest(this.drmConfig, event.message);
+      const response = await fetch(request.url, {
+        method: request.method,
+        body: request.data ?? null,
+        ...(request.headers ? { headers: request.headers } : {}),
         signal: state.abort.signal,
       });
       if (!live()) return;
