@@ -3907,6 +3907,105 @@ describe('MseMediaSource DRM lifecycle', () => {
         expect(sessions[0]!.update).not.toHaveBeenCalled();
         expect(sessions[0]!.close).toHaveBeenCalledTimes(1);
     });
+
+    function requestedConfiguration(requestAccess: ReturnType<typeof vi.fn>): MediaKeySystemConfiguration {
+        return (requestAccess.mock.calls[0]![1] as MediaKeySystemConfiguration[])[0]!;
+    }
+
+    it('negotiates key system capabilities from the codecs initialize() selects', async () => {
+        const { adapter, encrypted, requestAccess } = setup();
+        adapter.initialize({
+            video: { codec: 'hvc1.1.6.L93.B0', initData: Uint8Array.of(1) },
+            audio: { codec: 'mp4a.40.5', initData: Uint8Array.of(1) },
+        });
+        await encrypted(1);
+        expect(requestAccess).toHaveBeenCalledExactlyOnceWith('com.widevine.alpha', expect.any(Array));
+        const config = requestedConfiguration(requestAccess);
+        expect(config.initDataTypes).toEqual(['cenc']);
+        expect(config.videoCapabilities).toEqual([{ contentType: 'video/mp4; codecs="hvc1.1.6.L93.B0"', robustness: '' }]);
+        expect(config.audioCapabilities).toEqual([{ contentType: 'audio/mp4; codecs="mp4a.40.5"', robustness: '' }]);
+        expect(config.sessionTypes).toEqual(['temporary']);
+    });
+
+    it('omits the audio capability for a video-only initialization', async () => {
+        const { adapter, encrypted, requestAccess } = setup();
+        adapter.initialize({ video: { codec: 'avc1.42c01e', initData: Uint8Array.of(1) } });
+        await encrypted(1);
+        const config = requestedConfiguration(requestAccess);
+        expect(config.videoCapabilities).toEqual([{ contentType: 'video/mp4; codecs="avc1.42c01e"', robustness: '' }]);
+        expect(config.audioCapabilities).toBeUndefined();
+    });
+
+    it('takes capability codecs from the DrmConfig when it names them', async () => {
+        const { encrypted, requestAccess, reconnect, adapter } = setup();
+        adapter.destroy();
+        reconnect({ videoCodecs: ['av01.0.08M.08'], audioCodecs: ['opus'] });
+        await encrypted(1);
+        const config = requestedConfiguration(requestAccess);
+        expect(config.videoCapabilities?.map((c) => c.contentType)).toEqual(['video/mp4; codecs="av01.0.08M.08"']);
+        expect(config.audioCapabilities?.map((c) => c.contentType)).toEqual(['audio/mp4; codecs="opus"']);
+    });
+
+    it('falls back to the default capabilities when encrypted media precedes initialize()', async () => {
+        const { encrypted, requestAccess } = setup();
+        await encrypted(1);
+        const config = requestedConfiguration(requestAccess);
+        expect(config.videoCapabilities?.map((c) => c.contentType)).toEqual([
+            'video/mp4; codecs="avc1.640028"', 'video/mp4; codecs="avc3.640028"',
+        ]);
+        expect(config.audioCapabilities?.map((c) => c.contentType)).toEqual(['audio/mp4; codecs="mp4a.40.2"']);
+    });
+
+    it('reports a rejected key system request with the capabilities it asked for', async () => {
+        const { adapter, encrypted, requestAccess } = setup();
+        requestAccess.mockRejectedValueOnce(new DOMException('unsupported', 'NotSupportedError'));
+        const onError = vi.fn();
+        adapter.onError = onError;
+        await encrypted(1);
+        expect(onError).toHaveBeenCalledTimes(1);
+        expect(onError.mock.calls[0]![0].message).toContain('com.widevine.alpha');
+        expect(onError.mock.calls[0]![0].message).toContain('avc1.640028');
+    });
+
+    it('unwraps the PlayReady challenge and HTTP headers from the key message', async () => {
+        const { adapter, encrypted, sessions, reconnect } = setup();
+        adapter.destroy();
+        reconnect({ keySystem: 'com.microsoft.playready.recommendation' });
+        const fetchLicense = vi.fn(async (_url: string, _init: RequestInit) => ({
+            ok: true, arrayBuffer: async () => new ArrayBuffer(1),
+        }));
+        vi.stubGlobal('fetch', fetchLicense);
+        await encrypted(1);
+        const xml = '<PlayReadyKeyMessage type="LicenseAcquisition"><LicenseAcquisition Version="1">'
+            + '<Challenge encoding="base64encoded">AQID</Challenge>'
+            + '<HttpHeaders><HttpHeader><name>Content-Type</name><value>text/xml; charset=utf-8</value></HttpHeader>'
+            + '<HttpHeader><name>SOAPAction</name><value>"http://schemas.microsoft.com/DRM/2007/03/protocols/AcquireLicense"</value></HttpHeader>'
+            + '</HttpHeaders></LicenseAcquisition></PlayReadyKeyMessage>';
+        const utf16 = Uint16Array.from(xml, (c) => c.charCodeAt(0)).buffer;
+        sessions[0]!.dispatch({ type: 'message', message: utf16, target: sessions[0] } as unknown as Event);
+        await settle();
+        expect(fetchLicense).toHaveBeenCalledTimes(1);
+        const init = fetchLicense.mock.calls[0]![1];
+        expect([...new Uint8Array(init.body as ArrayBuffer)]).toEqual([1, 2, 3]);
+        expect(init.headers).toEqual({
+            'Content-Type': 'text/xml; charset=utf-8',
+            SOAPAction: '"http://schemas.microsoft.com/DRM/2007/03/protocols/AcquireLicense"',
+        });
+    });
+
+    it('posts a Widevine key message verbatim with no synthesized headers', async () => {
+        const { encrypted, sessions, message } = setup();
+        const fetchLicense = vi.fn(async (_url: string, _init: RequestInit) => ({
+            ok: true, arrayBuffer: async () => new ArrayBuffer(1),
+        }));
+        vi.stubGlobal('fetch', fetchLicense);
+        await encrypted(1);
+        message(sessions[0]!, 7);
+        await settle();
+        const init = fetchLicense.mock.calls[0]![1];
+        expect([...new Uint8Array(init.body as ArrayBuffer)]).toEqual([7]);
+        expect(init.headers).toBeUndefined();
+    });
 });
 
 describe('seam-overlap default visibility (non-silent accountability)', () => {
