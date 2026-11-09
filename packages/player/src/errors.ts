@@ -7,9 +7,36 @@
  * Error codes use 0x1000+ range to avoid collision with IANA-assigned
  * MOQT error codes (§13.4) which live in 0x0–0xFFF.
  *
+ * Each code also maps to the closest SVTA2070 (Common Media Library) error
+ * code through {@link toSvtaErrorCode}, so applications that aggregate errors
+ * from several players can classify Playa errors alongside everything else.
+ *
  * @see draft-ietf-moq-transport-16 §13.4 (IANA Error Codes)
+ * @see https://github.com/streaming-video-technology-alliance/common-media-library (cml-error-codes)
  * @module
  */
+
+import {
+  SVTA_BUFFER_NUDGE_ON_STALL,
+  SVTA_BUFFER_SEEK_OVER_HOLE,
+  SVTA_AUDIO_DECODE_ERROR,
+  SVTA_DOWNLOAD_ERROR,
+  SVTA_FRAGMENT_TIMEOUT_ERROR,
+  SVTA_INITIALIZATION_SEGMENT_ERROR,
+  SVTA_LIVE_TIMESHIFT_OUT_OF_BOUNDS,
+  SVTA_MANIFEST_PARSE_ERROR,
+  SVTA_MEDIA_UNAVAILABLE,
+  SVTA_NETWORK_UNKNOWN,
+  SVTA_NO_MATCHING_CODEC,
+  SVTA_NO_NETWORK_CONNECTION,
+  SVTA_PRIMARY_MANIFEST_LOAD_TIMEOUT,
+  SVTA_RESOURCE_DENIED,
+  SVTA_SECONDARY_MANIFEST_PARSE_ERROR,
+  SVTA_SEGMENT_PARSE_ERROR,
+  SVTA_TRACK_LOAD_ERROR,
+  SVTA_VIDEO_DECODE_ERROR,
+  type SvtaErrorCode,
+} from '@svta/cml-error-codes';
 
 // ─── Severity ─────────────────────────────────────────────────────────
 
@@ -127,6 +154,55 @@ export const PlayerErrorCode = {
 /** Type of a PlayerErrorCode value. */
 export type PlayerErrorCodeValue = typeof PlayerErrorCode[keyof typeof PlayerErrorCode];
 
+// ─── SVTA2070 mapping ─────────────────────────────────────────────────
+
+/**
+ * Closest SVTA2070 error code for every {@link PlayerErrorCode}.
+ *
+ * The Playa codes stay in the 0x1000+ range (they must not collide with the
+ * IANA MoQT codes); this table is a one-way projection onto the SVTA
+ * categories (1xxx media content, 2xxx playback, 3xxx network) for
+ * cross-player error reporting. Several Playa codes legitimately share one
+ * SVTA code because SVTA2070 has no finer distinction.
+ */
+const SVTA_ERROR_CODE_BY_PLAYER_CODE: Readonly<Record<PlayerErrorCodeValue, SvtaErrorCode>> = {
+  // Connection — the MoQT session or a delivery stream failed.
+  [PlayerErrorCode.CONTROL_STREAM_LOST]: SVTA_NO_NETWORK_CONNECTION,
+  [PlayerErrorCode.DATA_STREAM_RESET]: SVTA_DOWNLOAD_ERROR,
+  [PlayerErrorCode.DATAGRAM_DECODE_ERROR]: SVTA_SEGMENT_PARSE_ERROR,
+  [PlayerErrorCode.CONNECTION_LOST]: SVTA_NO_NETWORK_CONNECTION,
+  [PlayerErrorCode.REQUEST_UPDATE_FAILED]: SVTA_NETWORK_UNKNOWN,
+  [PlayerErrorCode.MEDIA_STARVED]: SVTA_FRAGMENT_TIMEOUT_ERROR,
+  // Decoder / media element.
+  [PlayerErrorCode.VIDEO_DECODE_ERROR]: SVTA_VIDEO_DECODE_ERROR,
+  [PlayerErrorCode.AUDIO_DECODE_ERROR]: SVTA_AUDIO_DECODE_ERROR,
+  [PlayerErrorCode.MEDIA_ELEMENT_WEDGED]: SVTA_BUFFER_NUDGE_ON_STALL,
+  [PlayerErrorCode.MEDIA_GAP_UNRECOVERABLE]: SVTA_BUFFER_SEEK_OVER_HOLE,
+  [PlayerErrorCode.CODEC_UNSUPPORTED]: SVTA_NO_MATCHING_CODEC,
+  // Catalog — the MSF catalog is Playa's manifest.
+  [PlayerErrorCode.CATALOG_PARSE_ERROR]: SVTA_MANIFEST_PARSE_ERROR,
+  [PlayerErrorCode.CATALOG_DELTA_ERROR]: SVTA_SECONDARY_MANIFEST_PARSE_ERROR,
+  [PlayerErrorCode.CMAF_INIT_INVALID]: SVTA_INITIALIZATION_SEGMENT_ERROR,
+  [PlayerErrorCode.CMAF_INIT_TIMEOUT]: SVTA_INITIALIZATION_SEGMENT_ERROR,
+  [PlayerErrorCode.CATALOG_WAIT_TIMEOUT]: SVTA_PRIMARY_MANIFEST_LOAD_TIMEOUT,
+  // Playback / subscription.
+  [PlayerErrorCode.SEEK_FAILED]: SVTA_LIVE_TIMESHIFT_OUT_OF_BOUNDS,
+  [PlayerErrorCode.LOAD_FAILED]: SVTA_TRACK_LOAD_ERROR,
+  [PlayerErrorCode.SUBSCRIPTION_REFUSED]: SVTA_RESOURCE_DENIED,
+  [PlayerErrorCode.ALL_TRACKS_REFUSED]: SVTA_MEDIA_UNAVAILABLE,
+};
+
+/**
+ * Map a Playa error code to the closest SVTA2070 error code.
+ *
+ * Pure and total over {@link PlayerErrorCodeValue}; every Playa code has an
+ * entry, so the result is always one of the named `@svta/cml-error-codes`
+ * constants.
+ */
+export function toSvtaErrorCode(code: PlayerErrorCodeValue): SvtaErrorCode {
+  return SVTA_ERROR_CODE_BY_PLAYER_CODE[code];
+}
+
 // ─── PlayerError ──────────────────────────────────────────────────────
 
 /**
@@ -143,6 +219,12 @@ export interface PlayerError {
   readonly source: ErrorSource;
   /** Numeric code for programmatic matching. */
   readonly code: PlayerErrorCodeValue;
+  /**
+   * Closest SVTA2070 error code for {@link code} (see {@link toSvtaErrorCode}).
+   * Always set by {@link createPlayerError}; optional only so hand-built
+   * PlayerError values from before this field existed remain valid.
+   */
+  readonly svtaCode?: SvtaErrorCode;
   /** Human-readable description. */
   readonly message: string;
   /** Original error, if wrapping. */
@@ -158,7 +240,8 @@ export interface PlayerError {
 /**
  * Create a well-formed PlayerError.
  *
- * Stamps `timestampMs` automatically. Accepts optional `cause` and `context`.
+ * Stamps `timestampMs` and the SVTA2070 `svtaCode` automatically. Accepts
+ * optional `cause` and `context`.
  */
 export function createPlayerError(
   severity: ErrorSeverity,
@@ -171,6 +254,7 @@ export function createPlayerError(
     severity,
     source,
     code,
+    svtaCode: toSvtaErrorCode(code),
     message,
     ...(options?.cause ? { cause: options.cause } : {}),
     timestampMs: Date.now(),

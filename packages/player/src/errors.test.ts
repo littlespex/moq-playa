@@ -6,7 +6,8 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { createPlayerError, PlayerErrorCode, type PlayerError } from './errors.js';
+import * as svta from '@svta/cml-error-codes';
+import { createPlayerError, PlayerErrorCode, toSvtaErrorCode, type PlayerError } from './errors.js';
 
 describe('Error Taxonomy', () => {
   it('createPlayerError produces well-formed error', () => {
@@ -102,5 +103,40 @@ describe('Error Taxonomy', () => {
       );
       expect(err.source).toBe(source);
     }
+  });
+
+  describe('SVTA2070 mapping', () => {
+    const svtaConstants = new Map<number, string>();
+    for (const [name, value] of Object.entries(svta)) {
+      if (name.startsWith('SVTA_') && typeof value === 'number') svtaConstants.set(value, name);
+    }
+
+    it('every PlayerErrorCode maps to a named @svta/cml-error-codes constant', () => {
+      for (const [name, code] of Object.entries(PlayerErrorCode)) {
+        const mapped = toSvtaErrorCode(code);
+        expect(svtaConstants.has(mapped), `${name} → ${mapped}`).toBe(true);
+        // SVTA2070 category prefix: 1 media content, 2 playback, 3 network.
+        expect(Math.floor(mapped / 1000), `${name} → ${mapped}`).toBeGreaterThanOrEqual(1);
+        expect(Math.floor(mapped / 1000), `${name} → ${mapped}`).toBeLessThanOrEqual(3);
+      }
+    });
+
+    it('maps the representative codes to their SVTA counterparts', () => {
+      expect(toSvtaErrorCode(PlayerErrorCode.VIDEO_DECODE_ERROR)).toBe(svta.SVTA_VIDEO_DECODE_ERROR);
+      expect(toSvtaErrorCode(PlayerErrorCode.AUDIO_DECODE_ERROR)).toBe(svta.SVTA_AUDIO_DECODE_ERROR);
+      expect(toSvtaErrorCode(PlayerErrorCode.CATALOG_PARSE_ERROR)).toBe(svta.SVTA_MANIFEST_PARSE_ERROR);
+      expect(toSvtaErrorCode(PlayerErrorCode.CODEC_UNSUPPORTED)).toBe(svta.SVTA_NO_MATCHING_CODEC);
+      expect(toSvtaErrorCode(PlayerErrorCode.CONNECTION_LOST)).toBe(svta.SVTA_NO_NETWORK_CONNECTION);
+      expect(toSvtaErrorCode(PlayerErrorCode.SUBSCRIPTION_REFUSED)).toBe(svta.SVTA_RESOURCE_DENIED);
+      expect(toSvtaErrorCode(PlayerErrorCode.ALL_TRACKS_REFUSED)).toBe(svta.SVTA_MEDIA_UNAVAILABLE);
+    });
+
+    it('createPlayerError stamps svtaCode from the code', () => {
+      const err = createPlayerError(
+        'fatal', 'catalog', PlayerErrorCode.CMAF_INIT_INVALID, 'bad init',
+      );
+      expect(err.svtaCode).toBe(svta.SVTA_INITIALIZATION_SEGMENT_ERROR);
+      expect(err.svtaCode).toBe(toSvtaErrorCode(err.code));
+    });
   });
 });

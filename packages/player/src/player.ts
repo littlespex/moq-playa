@@ -36,6 +36,7 @@ import type { LocHeaders } from '@openmoq/loc';
 import { LocmafFormatError, LocmafTrackDecoder, deserializeLocmafObject, readVi64, sliceFrames, ticksToMicros, codecDescriptionFromInit, isCmafHeader, isSyncSampleFlags, readCmafChunkSamples, parseEmsgBoxes } from '@openmoq/locmaf';
 import type { EmsgEvent, LocmafEffectiveSamples, GenBox } from '@openmoq/locmaf';
 import { groupByAlt, parseSapTimeline, parseEventTimeline, CMSF_SAP_EVENT_TYPE, isTrackPackagingSupported } from '@openmoq/msf';
+import { decodeBase64, encodeBase64 } from '@svta/cml-utils';
 
 import { TypedEmitter } from './emitter.js';
 import { HookChain } from './hooks.js';
@@ -1497,7 +1498,7 @@ export class MoqtPlayer {
     try {
       const init = this.decodeResolvedInlineInitData(track);
       const description = init ? codecDescriptionFromInit(init) : null;
-      return description ? btoa(String.fromCharCode(...description)) : undefined;
+      return description ? encodeBase64(description) : undefined;
     } catch {
       return undefined; // an invalid inline init was already surfaced at selection time
     }
@@ -1802,7 +1803,7 @@ export class MoqtPlayer {
     if (initB64 === undefined) return undefined;
     let bytes: Uint8Array;
     try {
-      bytes = Uint8Array.from(atob(initB64), (c) => c.charCodeAt(0));
+      bytes = decodeBase64(initB64);
     } catch {
       throw new Error('inline init data is not valid base64');
     }
@@ -7608,8 +7609,6 @@ export class MoqtPlayer {
     // init data. (initData on TrackInfo is base64, CatalogTrack §5.1.20;
     // selection-time validation already rejected undecodable/empty values.)
     if (this.mediaSource && !this.cmafInitialized) {
-      const decodeBase64 = (b64: string): Uint8Array =>
-        Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
       this.cmafPendingInit = {};
       if (trackInfo.video && this.usesMse(trackInfo.video.packaging) && trackInfo.video.codec) {
         this.cmafPendingInit.video = {

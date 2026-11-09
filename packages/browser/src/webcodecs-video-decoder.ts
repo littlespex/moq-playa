@@ -20,6 +20,7 @@
 
 import type { VideoDecoderLike } from '@openmoq/player';
 import type { VideoChunkInit, SourceTimestamp } from '@openmoq/loc';
+import { arrayBufferToHex, encodeBase64 } from '@svta/cml-utils';
 import { createCodecStrategy } from './codec-strategy.js';
 import type { CodecStrategy } from './codec-strategy.js';
 
@@ -584,15 +585,12 @@ function copySourceTimestamp(chunk: VideoChunkInit, submittedTimestamp: number):
 }
 
 function hexPreview(data: Uint8Array): string {
-  const preview = Array.from(data.subarray(0, HEX_PREVIEW_BYTES), (b) =>
-    b.toString(16).padStart(2, '0'));
+  const preview = arrayBufferToHex(data.slice(0, HEX_PREVIEW_BYTES).buffer);
   const suffix = data.byteLength > HEX_PREVIEW_BYTES ? '+' : '';
-  return `${preview.join('')}${suffix}`;
+  return `${preview}${suffix}`;
 }
 
 function toBase64(data: Uint8Array | null | undefined): string {
   if (!data || data.byteLength === 0) return '';
-  let binary = '';
-  for (const byte of data) binary += String.fromCharCode(byte);
-  return btoa(binary);
+  return encodeBase64(data);
 }

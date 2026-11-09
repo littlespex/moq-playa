@@ -10,6 +10,7 @@
  */
 
 import { PlaybackPipeline, SyncController, DefaultRecoveryController } from '@openmoq/playback';
+import { decodeBase64 } from '@svta/cml-utils';
 import type {
   ClockSource,
   DecoderCommand,
@@ -371,7 +372,7 @@ export function configurePipelines(
 
     if (trackInfo.video.initData || trackInfo.video.codec) {
       const configBytes = trackInfo.video.initData
-        ? Uint8Array.from(atob(trackInfo.video.initData), c => c.charCodeAt(0))
+        ? decodeBase64(trackInfo.video.initData)
         : new Uint8Array(0);
       pipelines.videoPipeline.configure(configBytes);
     }
@@ -380,7 +381,7 @@ export function configurePipelines(
   if (pipelines.audioPipeline && trackInfo.audio) {
     if (trackInfo.audio.initData || trackInfo.audio.codec) {
       const configBytes = trackInfo.audio.initData
-        ? Uint8Array.from(atob(trackInfo.audio.initData), c => c.charCodeAt(0))
+        ? decodeBase64(trackInfo.audio.initData)
         : new Uint8Array(0);
       pipelines.audioPipeline.configure(configBytes);
     }
