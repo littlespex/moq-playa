@@ -9311,19 +9311,30 @@ describe('MoqtPlayer', () => {
         trackAlias: audioAlias, parameters: new Map(), trackExtensions: new Map(),
       } as any);
 
+      // One group per second. The throughput estimator samples each group as
+      // its bytes over its subgroup stream's header-to-FIN time, so model the
+      // stream: 800ms of publisher cadence, then the bytes cross the link in
+      // 200ms (payloadSize 2MB → 80Mbps; 50KB → 2Mbps).
       function feedGroups(count: number, startGroup = 0) {
         for (let g = startGroup; g < startGroup + count; g++) {
-          advanceClock(1_000_000);
-          adapter._triggerObject(BigInt(g + 1), {
+          const streamId = BigInt(g + 1);
+          advanceClock(800_000);
+          adapter.onDataStream?.(streamId, {
+            type: 'subgroup',
+            header: { typeByte: 0x10, trackAlias: videoAlias, groupId: varint(g), subgroupId: varint(0), publisherPriority: 128 },
+          });
+          advanceClock(200_000);
+          adapter._triggerObject(streamId, {
             kind: 'data', trackAlias: videoAlias,
             groupId: varint(g), subgroupId: varint(0), objectId: varint(0),
             payload: new Uint8Array(payloadSize), extensions: new Uint8Array(0),
           } as MoqtObject);
-          adapter._triggerObject(BigInt(g + 1), {
+          adapter._triggerObject(streamId, {
             kind: 'gap', trackAlias: videoAlias,
             groupId: varint(g), subgroupId: varint(0), objectId: varint(1),
             status: ObjectStatus.END_OF_GROUP,
           } as MoqtObject);
+          adapter.onStreamClosed?.(streamId, undefined, 'fin');
           player.tick();
         }
       }

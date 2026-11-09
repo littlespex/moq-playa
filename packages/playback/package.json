@@ -50,7 +50,10 @@
   },
   "dependencies": {
     "@openmoq/transport": "workspace:*",
-    "@openmoq/loc": "workspace:*"
+    "@openmoq/loc": "workspace:*",
+    "@svta/cml-utils": "^1.7.0",
+    "@svta/cml-throughput": "^1.2.0",
+    "@svta/cml-abr": "^0.3.0"
   },
   "scripts": {
     "build": "tsc && tsup",

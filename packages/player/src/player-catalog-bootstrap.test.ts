@@ -1823,11 +1823,13 @@ describe('catalog bootstrap wiring — candidate adoption and ownership tombston
         ackCatalog(adapter);
         adapter._triggerDataStream(400n, { type: 'subgroup', header: { trackAlias: varint(5n), groupId: varint(0n), subgroupId: varint(0n), publisherPriority: 128 } } as unknown as DataStreamHeader);
         const internals = player as unknown as { connection: unknown; subgroupStreams: Map<bigint, { trackAlias: bigint; groupId: bigint }> };
-        expect(internals.subgroupStreams.get(400n)).toEqual({ trackAlias: 5n, groupId: 0n });
+        // The entry also carries the stream's transfer timing for the
+        // throughput estimator; ownership is what this test pins.
+        expect(internals.subgroupStreams.get(400n)).toMatchObject({ trackAlias: 5n, groupId: 0n });
         const current = internals.connection;
         internals.connection = { draftVersion: 16 };
         adapter._triggerDataStream(400n, { type: 'subgroup', header: { trackAlias: varint(9n), groupId: varint(0n), subgroupId: varint(0n), publisherPriority: 128 } } as unknown as DataStreamHeader);
-        expect(internals.subgroupStreams.get(400n)).toEqual({ trackAlias: 5n, groupId: 0n });   // NOT overwritten
+        expect(internals.subgroupStreams.get(400n)).toMatchObject({ trackAlias: 5n, groupId: 0n });   // NOT overwritten
         internals.connection = current;
     });
 
